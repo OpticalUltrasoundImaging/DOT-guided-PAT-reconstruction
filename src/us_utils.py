@@ -6,12 +6,12 @@ import numpy as np
 from scipy import io as spio
 from scipy.signal import firwin2, convolve, hilbert
 from scipy.ndimage import zoom
-from src.load_data_utils import LSystemParam
-from src.recon_iq_utils import Apodization, Coherence
+from .load_data_utils import LinearSystemParam
+from .recon_iq_utils import Apodization, Coherence
 from tqdm import tqdm
 
 #%% US BEAMFORMING
-def _ch2sc_us_batch(mat: dict, info: LSystemParam, aligned_samples: int) -> np.ndarray:
+def _ch2sc_us_batch(mat: dict, info: LinearSystemParam, aligned_samples: int) -> np.ndarray:
     '''
     Ouputs Reconstruction matrix: (aligned_samples, N_ch, N_sc)
     '''
@@ -46,78 +46,91 @@ def _ch2sc_us_batch(mat: dict, info: LSystemParam, aligned_samples: int) -> np.n
     reordered[:rows_to_mask, :, :][mask] = 0.0
 
     Reconstruction = reordered.T  # (N_ch, total_rows, N_sc)
-    Reconstruction = Reconstruction[:, :aligned_samples, :].transpose(1, 0, 2)  # (aligned_samples, N_ch, N_sc)
+    Reconstruction = Reconstruction[:, :aligned_samples, :].transpose(0,2,1)  # (aligned_samples, N_ch, N_sc)
+    
     return Reconstruction
 
-def _process_scanline(Reconstruction: np.ndarray, 
-                      RxMux: np.ndarray, 
+
+def _process_scanline(Reconstruction: np.ndarray,
+                      RxMux: np.ndarray,
                       sc: int,
-                      info: LSystemParam,
+                      info: LinearSystemParam,
                       DC_cancel: np.ndarray,
                       d_sample: np.ndarray,
                       data_total: int,
-                      data_total1: int):
-    '''
-    Vectorized processing of one scanline:
-        - TOF adjustment
-        - DC cancellation
-        - Rx apodization
-    Returns
-    -------
-    RF_scanline_tofadjusted : np.ndarray
-        (data_total1, N_ch) RF data for scanline
-    active_ch : list
-        List of active channels
-    '''
-    _, N_ch = Reconstruction[:, :, sc].shape
-    ChData = Reconstruction[:, :, sc].astype(np.float64, copy=False)
-    MuxTbl = RxMux[sc, :].astype(int)
+                      data_total1: int) -> Tuple[np.ndarray, List[int]]:
+    
+    _, N_ch, n_scan_rec = Reconstruction.shape
+    if sc < 0 or sc >= n_scan_rec:
+        raise IndexError(f"scanline index sc={sc} is out of range (0..{n_scan_rec-1}) for Reconstruction")
 
-    # Identify active channels
-    active_mask = (MuxTbl >= 1) & (MuxTbl <= info.N_ele)
-    active_ch = np.nonzero(active_mask)[0]
+    ChData = Reconstruction[:, :, sc].astype(np.float64, copy=False)  # (aligned_samples, N_ch)
+    MuxTbl = RxMux[sc, :].astype(int) if RxMux.ndim == 2 else RxMux[sc].astype(int)  # (N_ch,)
+
+    # Active channels are those mapping to valid element indices (1-based in RxMux)
+    active_mask = (MuxTbl >= 1) & (MuxTbl <= int(getattr(info, "N_ele", np.max(MuxTbl))))
+    active_ch = np.nonzero(active_mask)[0]  # indices into channels (0-based)
     if active_ch.size == 0:
         return np.zeros((data_total1, N_ch), dtype=np.float64), []
-    ChData_active = ChData[:, active_ch]
-    Mux_active = MuxTbl[active_ch]
 
-    # DC cancel filter (along each A-line)
-    fil_tmp = np.apply_along_axis(lambda x: convolve(x, DC_cancel, mode='same'), 0, ChData_active)
+    # Select only active channels
+    ChData_active = ChData[:, active_ch]     # (aligned_samples, N_active)
+    Mux_active = MuxTbl[active_ch]           # element numbers (1-based)
+    fil_tmp = convolve(ChData_active, DC_cancel[:, None], mode='same', method='auto')
 
-    # Compute per-channel distances
-    sc_pos = info.ScanPosition[sc] if np.ndim(info.ScanPosition) else float(info.ScanPosition)
-    ElePos = np.array([info.ElePosition[i - 1] for i in Mux_active], dtype=float)
-    x = np.abs(sc_pos - ElePos)  # shape (N_active,)
+    # ---------------------
+    # Compute per-channel geometry and TOF mapping
+    sc_pos = float(info.ScanPosition[sc]) if np.ndim(info.ScanPosition) else float(info.ScanPosition)
+    ElePos = np.array([info.ElePosition[i - 1] for i in Mux_active], dtype=float)  # (N_active,)
+    x = np.abs(sc_pos - ElePos)  # (N_active,)
 
-    # TOF calculation
+    # tx_t (data_total1,) and rx_t (data_total1, N_active)
     tx_t = d_sample / info.c  # (data_total1,)
     rx_t = np.sqrt(d_sample[:, None] ** 2 + x[None, :] ** 2) / info.c  # (data_total1, N_active)
-    TOF = tx_t[:, None] + rx_t
-    RxReadPointer = np.round(TOF * info.fs).astype(int) - 1  # 0-based
-    RxReadPointer = np.clip(RxReadPointer, 0, data_total - 1)
-    row_idx = RxReadPointer
-    col_idx = np.arange(active_ch.size)[None, :]
-    rf_tmp = fil_tmp[row_idx, col_idx]  # shape (data_total1, N_active)
+    TOF = tx_t[:, None] + rx_t  # (data_total1, N_active)
 
-    # Zero out-of-bounds samples
-    below_mask = RxReadPointer < 0
-    above_mask = RxReadPointer >= data_total
-    rf_tmp[below_mask] = 0.0
-    rf_tmp[above_mask] = 0.0
+    # raw indices using MATLAB rounding convention -> convert to 0-based
+    raw_idx = np.round(TOF * info.fs).astype(np.int64) - 1  # may contain OOB values
 
-    # Rx apodization
-    h_aper_size = d_sample[:, None] / info.RxFnum * 0.5
-    half_rx_ch = info.half_rx_ch
-    Rx_apod_idx = np.where(h_aper_size >= half_rx_ch, x / half_rx_ch, x / h_aper_size)
-    Rx_apo_r = np.ones_like(Rx_apod_idx)
-    Rx_apo_r[Rx_apod_idx >= 1.0] = 0.0
+    # Use actual fil_tmp depth for clipping, NOT the passed-in data_total
+    data_total_local = fil_tmp.shape[0]
+    below_mask = raw_idx < 0
+    above_mask = raw_idx >= data_total_local
+
+    # Clip indices to valid range for safe indexing
+    idx_clipped = np.clip(raw_idx, 0, data_total_local - 1).astype(np.intp)  # shape (data_total1, N_active)
+
+    # Gather samples per (depth, channel) using take_along_axis
+    # fil_tmp: (data_total_local, N_active), idx_clipped: (data_total1, N_active)
+    rf_tmp = np.take_along_axis(fil_tmp, idx_clipped, axis=0)  # (data_total1, N_active)
+
+    # Zero out-of-range samples according to original raw_idx masks
+    if np.any(below_mask):
+        rf_tmp[below_mask] = 0.0
+    if np.any(above_mask):
+        rf_tmp[above_mask] = 0.0
+
+    h_aper_size = (d_sample[:, None] / info.RxFnum) * 0.5               # (data_total1, 1)
+    half_rx_ch = float(info.half_rx_ch)
+
+    mask_large = (h_aper_size >= half_rx_ch)                           # bool (data_total1, 1)
+    x_b = x[None, :]
+    h_safe = np.where(h_aper_size > 0.0, h_aper_size, np.inf)
+    Rx_apod_idx = np.empty((h_aper_size.shape[0], x_b.shape[1]), dtype=np.float64)
+    Rx_apod_idx[mask_large[:, 0], :] = x_b[mask_large[:, 0], :] / half_rx_ch
+    Rx_apod_idx[~mask_large[:, 0], :] = x_b[~mask_large[:, 0], :] / h_safe[~mask_large[:, 0], :]
+
+    Rx_apo_r = (Rx_apod_idx < 1.0).astype(np.float64)
+    Rx_apo_r = np.nan_to_num(Rx_apo_r, copy=False)
+
+    # Place results into full-width RF matrix (data_total1, N_ch)
     RF_scanline_tofadjusted = np.zeros((data_total1, N_ch), dtype=np.float64)
     RF_scanline_tofadjusted[:, active_ch] = rf_tmp * Rx_apo_r
 
     return RF_scanline_tofadjusted, active_ch.tolist()
 
 def pe_das_linear(input_dir: str, 
-                  info: LSystemParam, 
+                  info: LinearSystemParam, 
                   dB_US: float, 
                   apod_method: str, 
                   coherence_method: str, 
@@ -149,6 +162,7 @@ def pe_das_linear(input_dir: str,
 
     # Reconstruction shape (AlignedSampleNum, N_ch, Nsc)
     Reconstruction = _ch2sc_us_batch(mat, info, aligned_samples)
+    print(Reconstruction.shape)
 
     # Precompute DC cancellation FIR filter (fir2 equivalent)
     # MATLAB: f = [0 0.1 0.1 1]; m = [0 0 1 1]; DC_cancel = fir2(64,f,m)

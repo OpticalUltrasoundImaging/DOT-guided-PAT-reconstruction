@@ -1,11 +1,11 @@
 import numpy as np
 from scipy.signal import convolve, windows, firwin2
-from scipy.ndimage import ndi
+from scipy.ndimage import uniform_filter1d
 from numpy.lib.stride_tricks import as_strided
-from load_data_utils import LSystemParam
+from .load_data_utils import LinearSystemParam
 
 class Apodization:
-    def __init__(self, RF_scanline_tofadjusted: np.ndarray, active_ch: np.ndarray, info: LSystemParam):
+    def __init__(self, RF_scanline_tofadjusted: np.ndarray, active_ch: np.ndarray, info: LinearSystemParam):
         self.RF = RF_scanline_tofadjusted
         self.active_ch = active_ch
         self.info = info
@@ -84,7 +84,7 @@ class Apodization:
         return np.nan_to_num(sum_tmp, nan=0.0)
 
 class Coherence:
-    def __init__(self, RF_scanline_tofadjusted: np.ndarray, active_ch: np.ndarray, info:LSystemParam):
+    def __init__(self, RF_scanline_tofadjusted: np.ndarray, active_ch: np.ndarray, info:LinearSystemParam):
         self.RF = RF_scanline_tofadjusted
         self.active_ch = active_ch
         self.info = info
@@ -146,8 +146,12 @@ class Coherence:
 
         # Step 1: Moving mean of squared signals across channels
         sq = arr ** 2
-        mean_sq = ndi.uniform_filter1d(sq, size=kernel_size, axis=1, mode='nearest')
-        square_root4_terms = (kernel_size * mean_sq) ** 0.25
+        mean_sq = uniform_filter1d(sq, size=kernel_size, axis=1, mode='nearest')
+        mean_sq_clipped = np.maximum(mean_sq, 0.0)
+        square_root4_terms = (kernel_size * mean_sq_clipped) ** 0.25
+        safe_den = np.where(square_root4_terms > 0.0, square_root4_terms, np.inf)
+        sc_terms = arr / safe_den
+        sc_terms = np.nan_to_num(sc_terms, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Step 2: Normalize
         sc_terms = np.divide(arr, square_root4_terms, out=np.zeros_like(arr), where=square_root4_terms != 0)

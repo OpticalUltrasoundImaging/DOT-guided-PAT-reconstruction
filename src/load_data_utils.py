@@ -22,20 +22,39 @@ class LinearSystemParam:
     fc: float
     ele_width: float
     ele_height: float
-    pixel_d: float
-    N_sc: int
-    N_ch: int
-    Nfocus: int
-    fc_scaled: float
-    RxFnum: float
-    FOV: float
-    x0: float
-    dx: float
-    ScanPosition: np.ndarray
-    ElePosition: np.ndarray
-    half_rx_ch: float
-    d_sample: np.ndarray
+    pixel_d: float = None
+    N_sc: int = None
+    N_ch: int = None
+    Nfocus: int = None
+    fc_scaled: float = None
+    RxFnum: float = None
+    FOV: float = None
+    x0: float = None
+    dx: float = None
+    ScanPosition: np.ndarray = None
+    ElePosition: np.ndarray = None
+    half_rx_ch: float = None
+    d_sample: np.ndarray = None
 
+    def __post_init__(self):
+        # Derived scalars
+        if self.pixel_d is None:
+            self.pixel_d = self.c / self.fs / 2
+        if self.fc_scaled is None:
+            self.fc_scaled = self.fc / self.fs * self.Nfocus / 2
+        if self.dx is None:
+            self.dx = self.FOV / (self.N_sc - 1)
+        if self.half_rx_ch is None:
+            self.half_rx_ch = self.N_ch * self.pitch * 0.5
+
+        # Derived arrays
+        if self.ScanPosition is None:
+            self.ScanPosition = np.linspace(self.x0, self.x0 + (self.N_sc-1)*self.dx, self.N_sc)
+        if self.ElePosition is None:
+            self.ElePosition = np.linspace(self.x0, -self.x0, self.N_ele)
+        if self.d_sample is None:
+            self.d_sample = np.arange(self.Nfocus) * self.pixel_d
+    
     def as_dict(self) -> dict:
         d = asdict(self)
         for k, v in d.items():
