@@ -2,20 +2,49 @@
 from typing import Tuple, Union, Optional, Any, Sequence, Mapping
 import os
 import warnings
-
 import numpy as np
 from scipy import io as spio
 from scipy.signal import firwin2, convolve, hilbert
 from scipy.ndimage import zoom
 from types import SimpleNamespace
+from __future__ import annotations
+from dataclasses import dataclass, asdict
 
 #%% US BEAMFORMING
-def load_sequence_info():
+def _load_sequence_info():
     mat = spio.loadmat(r'artifact/LSequence.mat', squeeze_me=True, struct_as_record=False)
     Roi = mat.get('Roi')
     System = mat.get('System')
     return Roi, System
+@dataclass
+class LinearSystemParamUS:
+    c: float
+    fs: float
+    N_ele: float
+    pitch: float
+    fc: float
+    ele_width: float
+    ele_height: float
+    pixel_d: float
+    N_sc: int
+    N_ch: int
+    Nfocus: int
+    fc_scaled: float
+    RxFnum: float
+    FOV: float
+    x0: float
+    dx: float
+    ScanPosition: np.ndarray
+    ElePosition: np.ndarray
+    half_rx_ch: float
+    d_sample: np.ndarray
 
+    def as_dict(self) -> dict:
+        d = asdict(self)
+        for k, v in d.items():
+            if isinstance(v, np.ndarray):
+                d[k] = v.tolist()
+        return d
 
 def _get_nested(obj: Any, path: Sequence[str], default: Any = None) -> Any:
     '''
@@ -30,9 +59,63 @@ def _get_nested(obj: Any, path: Sequence[str], default: Any = None) -> Any:
             cur = getattr(cur, p, default)
     return cur
 
+def _load_lsystem_param_us(Roi: Sequence[Any], System: Any, *,
+                           offset: int = 0, default_Nfocus: int = 3000) -> LinearSystemParamUS:
+    c = 1540.0  # speed of sound in tissue (m/s)
+    sample_freq_mhz = _get_nested(System, ["Parameters", "sampleFreqMHz"])
+    fs = float(sample_freq_mhz) * 1e6  # Hz
+    N_ele = int(_get_nested(System, ["Transducer", "elementCnt"]) or 0)
+    pitch_cm = _get_nested(System, ["Transducer", "elementPitchCm"])
+    pitch = float(pitch_cm) / 100.0  # convert cm->m
+    freq_mhz = _get_nested(System, ["Transducer", "frequencyMHz"])
+    fc = float(freq_mhz) * 1e6  # convert MHz->Hz
+    ele_width_cm = _get_nested(System, ["Transducer", "elementWidthCm"])
+    ele_width = float(ele_width_cm) / 100.0  # convert cm->m
+    ele_height = 6e-3  # m
+    pixel_d = c / fs / 2.0  # physical distance per sample (m)
+    N_sc = N_ele
+    N_ch = int(_get_nested(System, ["Parameters", "receiveNum"]) or 0)
+    Nfocus = int(default_Nfocus)
+    fc_scaled = fc / fs * Nfocus / 2.0
+    RxFnum = 1.0
+    lateral_length_cm = (getattr(Roi[0], "lateralLength", None)
+                         if not isinstance(Roi[0], Mapping)
+                         else Roi[0].get("lateralLength"))
+    FOV = float(lateral_length_cm)*1e-2 # convert cm -> m
+    x0 = -FOV / 2.0
+    dx = FOV / (N_sc-1) # separation between scan lines
+    ScanPosition = np.linspace(x0, x0 + (N_sc - 1) * dx, num = N_sc)
+    ElePosition = np.arange(x0, -x0 + pitch * 0.5, pitch)
+    half_rx_ch = N_ch * pitch * 0.5
+    n_sample = np.arange(Nfocus, dtype=float) + float(offset)
+    d_sample = n_sample * pixel_d
 
-@dataclass
-class LinearSystemParamUS:
+    return LinearSystemParamUS(
+        c=c,
+        fs=fs,
+        N_ele=N_ele,
+        pitch=pitch,
+        fc=fc,
+        ele_width=ele_width,
+        ele_height=ele_height,
+        pixel_d=pixel_d,
+        N_sc=N_sc,
+        N_ch=N_ch,
+        Nfocus=Nfocus,
+        fc_scaled=fc_scaled,
+        RxFnum=RxFnum,
+        FOV=FOV,
+        x0=x0,
+        dx=dx,
+        ScanPosition=ScanPosition,
+        ElePosition=ElePosition,
+        half_rx_ch=half_rx_ch,
+        d_sample=d_sample,
+    )
+
+def linear_us_param():
+    roi_us , sys_us = _load_sequence_info()
+    return _load_lsystem_param_us(roi_us , sys_us)
 
 def ch2sc_us(scanline_idx: int,
              elementNum: int,
