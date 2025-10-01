@@ -1,5 +1,5 @@
 #%% IMPORT LIBRARIES
-from typing import Tuple, Union, Optional, Any
+from typing import Tuple, Union, Optional, Any, Sequence, Mapping
 import os
 import warnings
 
@@ -12,7 +12,27 @@ from types import SimpleNamespace
 #%% US BEAMFORMING
 def load_sequence_info():
     mat = spio.loadmat(r'artifact/LSequence.mat', squeeze_me=True, struct_as_record=False)
+    Roi = mat.get('Roi')
+    System = mat.get('System')
+    return Roi, System
 
+
+def _get_nested(obj: Any, path: Sequence[str], default: Any = None) -> Any:
+    '''
+    '''
+    cur = obj
+    for p in path:
+        if cur is None: return default
+        # mapping/dict-like
+        if isinstance(cur, Mapping):
+            cur = cur.get(p, default)
+        else:
+            cur = getattr(cur, p, default)
+    return cur
+
+
+@dataclass
+class LinearSystemParamUS:
 
 def ch2sc_us(scanline_idx: int,
              elementNum: int,
