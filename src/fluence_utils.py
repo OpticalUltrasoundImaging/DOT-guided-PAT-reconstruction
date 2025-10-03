@@ -180,93 +180,73 @@ def compute_phi_homogeneous(mu_a: float,
             "z grid": z,
             "fluence": Phi}
 
-def _plot_fluence_panels(Phi, x, y, z, fiber_offsets=[(+0.5, +0.9), (+0.5, -0.9), (-0.5, +0.9), (-0.5, -0.9)], figsize=(10,12), cmap='turbo'):
-    ny, nx, nz = Phi.shape
+def _plot_fluence_panels(phi, X, Y, Z, src_positions=[(+0.5, +0.9), (+0.5, -0.9), (-0.5, +0.9), (-0.5, -0.9)], cmap = 'inferno'):
+    ny, nx, nz = phi.shape
+    yc, xc = ny // 2, nx // 2
 
-    # Prepare derived images
-    surface = Phi[:, :, 0]                       # ny x nx (y rows, x cols)
-    iy_center = ny // 2
-    ix_center = nx // 2
-    xz_center = Phi[iy_center, :, :].T           # (nz, nx)
-    xz_avg = Phi.mean(axis=0).T                  # (nz, nx)
-    yz_center = Phi[:, ix_center, :].T           # (nz, ny)
-    yz_avg = Phi.mean(axis=1).T                  # (nz, ny)
+    fig, axs = plt.subplots(3, 2, figsize=(12, 14))
+    axs = axs.flatten()
 
-    # Shared color scale: use robust percentile to avoid outliers dominating
-    vmin = np.percentile(Phi, 1.0)
-    vmax = np.percentile(Phi, 99.9)
-    if vmin == vmax:
-        vmin = Phi.min()
-        vmax = Phi.max()
+    # Surface fluence (z=0)
+    fig_tmp = phi[:, :, 1]
+    im0 = axs[0].imshow(fig_tmp, extent=[X.min(), X.max(), Y.min(), Y.max()], vmax = np.percentile(fig_tmp, 99.5),
+                        origin='lower', cmap=cmap)
+    axs[0].set_title("Surface fluence (z = 0.075 cm)")
+    axs[0].set_xlabel("x (cm)")
+    axs[0].set_ylabel("y (cm)")
+    for xf, yf in src_positions:
+        axs[0].plot(xf, yf, marker='o', markersize=6, markeredgecolor='k', markerfacecolor='w', linewidth=1)
+    cbar0 = fig.colorbar(im0, ax=axs[0])
+    cbar0.set_label('W·cm\u207B\u00B3', fontsize=11)
 
-    # Create figure + grid
-    fig = plt.figure(figsize=figsize, constrained_layout=False)
-    gs = gridspec.GridSpec(nrows=3, ncols=2, height_ratios=[1.0, 0.9, 0.9], hspace=0.25, wspace=0.18)
+    # Center x-z slice (at central y)
+    fig_tmp = phi[yc, :, :].T
+    im1 = axs[2].imshow(fig_tmp, extent=[X.min(), X.max(), Z.min(), Z.max()], vmax = np.percentile(fig_tmp, 99.5),
+                        origin='lower', aspect='auto', cmap=cmap)
+    axs[2].set_title("Center x–z slice (central y)")
+    axs[2].set_xlabel("x (cm)")
+    axs[2].set_ylabel("z (cm)")
+    axs[2].invert_yaxis() 
+    cbar1 = fig.colorbar(im1, ax=axs[2])
+    cbar1.set_label('W·cm\u207B\u00B3', fontsize=11)
 
-    # Row 1: Surface (span both columns)
-    ax_surf = fig.add_subplot(gs[0, :])
-    im0 = ax_surf.imshow(surface, origin='lower',
-                         extent=[x[0], x[-1], y[0], y[-1]],
-                         aspect='auto', vmin=vmin, vmax=vmax, cmap=cmap, interpolation='bilinear')
-    ax_surf.set_title('Surface fluence (z = 0 cm)', fontsize=14, fontweight='semibold')
-    ax_surf.set_xlabel('x (cm)', fontsize=11)
-    ax_surf.set_ylabel('y (cm)', fontsize=11)
-    ax_surf.tick_params(labelsize=9)
-    if fiber_offsets:
-        fx = [pt[0] for pt in fiber_offsets]
-        fy = [pt[1] for pt in fiber_offsets]
-        ax_surf.scatter(fx, fy, s=64, facecolors='white', edgecolors='black', lw=0.8, zorder=4)
+    # Average x-z over y
+    fig_tmp = phi.mean(axis=0).T
+    im2 = axs[3].imshow(fig_tmp, extent=[X.min(), X.max(), Z.min(), Z.max()],vmax = np.percentile(fig_tmp, 99.5),
+                        origin='lower', aspect='auto', cmap=cmap)
+    axs[3].set_title("x–z averaged over y")
+    axs[3].set_xlabel("x (cm)")
+    axs[3].set_ylabel("z (cm)")
+    axs[3].invert_yaxis() 
+    cbar2 = fig.colorbar(im2, ax=axs[3])
+    cbar2.set_label('W·cm\u207B\u00B3', fontsize=11)
 
-    # colorbar for the top (shared visually) — place to the right of row 1 spanning rows
-    cbar_ax = fig.add_axes([0.92, 0.55, 0.015, 0.36])  # [left, bottom, width, height] in figure coords
-    cbar = fig.colorbar(im0, cax=cbar_ax)
-    cbar.set_label('W·cm\u207B\u00B3', fontsize=11)
-    cbar.ax.tick_params(labelsize=9)
+    # Center y-z slice (at central x)
+    fig_tmp = phi[:, xc, :].T
+    im3 = axs[4].imshow(fig_tmp, extent=[Y.min(), Y.max(), Z.min(), Z.max()],vmax = np.percentile(fig_tmp, 99.5),
+                        origin='lower', aspect='auto', cmap=cmap)
+    axs[4].set_title("Center y–z slice (central x)")
+    axs[4].set_xlabel("y (cm)")
+    axs[4].set_ylabel("z (cm)")
+    axs[4].invert_yaxis() 
+    cbar3 = fig.colorbar(im3, ax=axs[4])
+    cbar3.set_label('W·cm\u207B\u00B3', fontsize=11)
 
-    # Row 2: center x-z (left) and x-z averaged over y (right)
-    ax_xz_center = fig.add_subplot(gs[1, 0])
-    im1 = ax_xz_center.imshow(xz_center, origin='lower',
-                              extent=[x[0], x[-1], z[0], z[-1]],
-                              aspect='auto', vmin=vmin, vmax=vmax/7, cmap=cmap, interpolation='bilinear')
-    ax_xz_center.set_title('Center x–z slice', fontsize=12, fontweight='semibold')
-    ax_xz_center.set_xlabel('x (cm)'); ax_xz_center.set_ylabel('z (cm)')
-    ax_xz_center.tick_params(labelsize=9)
+    # Average y-z over x
+    fig_tmp = phi.mean(axis=1).T
+    im4 = axs[5].imshow(fig_tmp, extent=[Y.min(), Y.max(), Z.min(), Z.max()],vmax = np.percentile(fig_tmp, 99.5),
+                        origin='lower', aspect='auto', cmap=cmap)
+    axs[5].set_title("y–z averaged over x")
+    axs[5].set_xlabel("y (cm)")
+    axs[5].set_ylabel("z (cm)")
+    axs[5].invert_yaxis() 
+    cbar4 = fig.colorbar(im4, ax=axs[5])
+    cbar4.set_label('W·cm\u207B\u00B3', fontsize=11)
 
-    ax_xz_avg = fig.add_subplot(gs[1, 1])
-    im2 = ax_xz_avg.imshow(xz_avg, origin='lower',
-                           extent=[x[0], x[-1], z[0], z[-1]],
-                           aspect='auto', vmin=vmin, vmax=vmax, cmap=cmap, interpolation='bilinear')
-    ax_xz_avg.set_title('x–z averaged over y', fontsize=12, fontweight='semibold')
-    ax_xz_avg.set_xlabel('x (cm)'); ax_xz_avg.set_ylabel('z (cm)')
-    ax_xz_avg.tick_params(labelsize=9)
+    # Hide empty 6th subplot
+    axs[1].axis("off")
 
-    # Row 3: center y-z (left) and y-z averaged over x (right)
-    ax_yz_center = fig.add_subplot(gs[2, 0])
-    im3 = ax_yz_center.imshow(yz_center, origin='lower',
-                             extent=[y[0], y[-1], z[0], z[-1]],
-                             aspect='auto', vmin=vmin, vmax=vmax/7, cmap=cmap, interpolation='bilinear')
-    ax_yz_center.set_title('Center y–z slice', fontsize=12, fontweight='semibold')
-    ax_yz_center.set_xlabel('y (cm)'); ax_yz_center.set_ylabel('z (cm)')
-    ax_yz_center.tick_params(labelsize=9)
-
-    ax_yz_avg = fig.add_subplot(gs[2, 1])
-    im4 = ax_yz_avg.imshow(yz_avg, origin='lower',
-                          extent=[y[0], y[-1], z[0], z[-1]],
-                          aspect='auto', vmin=vmin, vmax=vmax, cmap=cmap, interpolation='bilinear')
-    ax_yz_avg.set_title('y–z averaged over x', fontsize=12, fontweight='semibold')
-    ax_yz_avg.set_xlabel('y (cm)'); ax_yz_avg.set_ylabel('z (cm)')
-    ax_yz_avg.tick_params(labelsize=9)
-
-    # Subtle styling
-    for ax in [ax_xz_center, ax_xz_avg, ax_yz_center, ax_yz_avg, ax_surf]:
-        # thin border, light grid lines optional
-        for spine in ax.spines.values():
-            spine.set_linewidth(0.6)
-        ax.grid(False)
-
-    fig.suptitle('Fluence in homogeneous medium (Diffusion equation with Robin BC)', fontsize=16, fontweight='bold', y=0.98)
-
-    # Tidy layout & show
-    plt.subplots_adjust(left=0.06, right=0.9, top=0.94, bottom=0.06, hspace=0.28, wspace=0.22)
+    fig.suptitle("Fluence in homogeneous medium (Diffusion equation with Robin BC)", fontsize=16, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 

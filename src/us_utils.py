@@ -58,7 +58,7 @@ def _process_scanline(Reconstruction: np.ndarray,
                       DC_cancel: np.ndarray,
                       d_sample: np.ndarray,
                       data_total: int,
-                      data_total1: int) -> Tuple[np.ndarray, List[int]]:
+                      data_total1: int) -> Tuple[np.ndarray, list[int]]:
     
     _, N_ch, n_scan_rec = Reconstruction.shape
     if sc < 0 or sc >= n_scan_rec:
