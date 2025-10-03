@@ -3,9 +3,9 @@ import pandas as pd
 from scipy.optimize import nnls, curve_fit
 import scipy.sparse as spsp
 import scipy.sparse.linalg as spla
+from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-import matplotlib.gridspec as gridspec
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -250,3 +250,67 @@ def _plot_fluence_panels(phi, X, Y, Z, src_positions=[(+0.5, +0.9), (+0.5, -0.9)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
+
+def _tukey_weights(y_coords: np.ndarray, alpha: float = 0.2) -> np.ndarray:
+    L = y_coords.max() - y_coords.min()
+    u = (y_coords - y_coords.min()) / L
+    w = np.ones_like(u)
+    a = alpha / 2.0
+    # rising taper
+    left = u < a
+    if np.any(left):
+        w[left] = 0.5 * (1.0 + np.cos(np.pi * (2*u[left]/alpha - 1.0)))
+    # falling taper
+    right = u > 1 - a
+    if np.any(right):
+        w[right] = 0.5 * (1.0 + np.cos(np.pi * (2*(u[right]-1)/alpha + 1.0)))
+    return w
+
+def estimate_mu_a_from_pa_with_ywindow(
+    pa_zx: np.ndarray,
+    fluence3d: np.ndarray,
+    mu_a_global: float,
+    y_coords: Optional[np.ndarray] = None,
+    eps: float = 1e-12,
+    smoothing_sigma: float = 0.25,
+    clip_min: float = 0.0,
+) -> Dict[str, np.ndarray]:
+    '''
+    pa_zx: (Nz, Nx)
+    fluence3d: (Ny, Nx, Nz)
+    '''
+    ny, nx, nz = fluence3d.shape
+    assert(pa_zx.shape == (nz,nx))
+    assert(y_coords.size == ny)
+    w = _tukey_weights(y_coords, alpha=0.2)
+    w /= (w.sum() + eps)
+
+    flu_2d = np.tensordot(w, fluence3d, axes=([0], [0]))   # shape (Nx, Nz)
+    flu_2d = flu_2d.T   # shape (Nz, Nx)
+
+    mask = (flu_2d > eps)
+    safe_flu = flu_2d.copy()
+    safe_flu[~mask] = np.nan
+    mu_raw = pa_zx / (safe_flu + eps)
+    mu_raw_filled = np.nan_to_num(mu_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # compute scaling to enforce mu_a_global (from DOT)
+    mu_raw_mean = mu_raw_filled[mask].mean()
+    scale = float(mu_a_global) / float(mu_raw_mean)
+    mu_a_map = mu_raw_filled * scale
+    if smoothing_sigma and smoothing_sigma > 0:
+        mu_a_map = gaussian_filter(mu_a_map, sigma=smoothing_sigma)
+
+    mu_mean_after = mu_a_map[mask].mean()
+    renorm = float(mu_a_global) / float(mu_mean_after)
+    mu_a_map *= renorm
+    scale *= renorm
+    mu_a_map = np.maximum(mu_a_map, clip_min)
+
+    return {
+        "Scaled PAT mu_a": mu_a_map,
+        "Raw PAT mu_a": mu_raw_filled,
+        "Elevational window": w,
+        "Background DOT mu_a": mu_a_global,
+        "Scan plane fluence": flu_2d,
+    }
