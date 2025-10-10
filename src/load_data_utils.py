@@ -22,6 +22,7 @@ class LinearSystemParam:
     fc: float
     ele_width: float
     ele_height: float
+    fc_signal: float = 2.0e6 # default 2.0 MHz for PA
     pixel_d: float = None
     N_sc: int = None
     N_ch: int = None
@@ -51,7 +52,7 @@ class LinearSystemParam:
         if self.ScanPosition is None:
             self.ScanPosition = np.linspace(self.x0, self.x0 + (self.N_sc-1)*self.dx, self.N_sc)
         if self.ElePosition is None:
-            self.ElePosition = np.linspace(self.x0, -self.x0, self.N_ele)
+            self.ElePosition = np.linspace(self.x0-self.ele_width/2.0, -self.x0, self.N_ele)
         if self.d_sample is None:
             self.d_sample = np.arange(self.Nfocus) * self.pixel_d
     
@@ -123,17 +124,17 @@ def _load_lsystem_param_pa(Roi: Sequence[Any], System: Any, *,
     fs = float(parameters['sampleFreqMHz'][0][0]) * 1e6  # Hz
     pitch = float(transducer['elementPitchCm'][0][0]) / 100.0 # convert cm->m
     fc = float(transducer['frequencyMHz'][0][0]) * 1e6 # convert MHz->Hz
-    N_ele = int(transducer['elementCnt'][0][0])
+    N_ele = (int(transducer['elementCnt'][0][0])* 2/3) # use 2/3 of elements for PAT, 128
     ele_width = float(transducer['elementWidthCm'][0][0]) / 100.0 # convert cm->m
     ele_height = 6e-3  # m
     pixel_d = c / fs  # physical distance per sample ONE-WAY (m)
-    N_sc = N_ele
+    N_sc = int(N_ele) 
 
     N_ch = int(parameters['receiveNum'][0][0])
     Nfocus = int(default_Nfocus)
     fc_scaled = fc / fs * Nfocus / 2.0
     RxFnum = 1.0
-    lateral_length_cm = Roi[0]['lateralLength'][0][0]
+    lateral_length_cm = Roi[0]['lateralLength'][0][0] * 2.0/3.0
     FOV = float(lateral_length_cm)*1e-2 # convert cm -> m
     x0 = -FOV / 2.0
     dx = FOV / (N_sc-1) # separation between scan lines

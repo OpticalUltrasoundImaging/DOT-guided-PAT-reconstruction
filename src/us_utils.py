@@ -1,11 +1,12 @@
 #%% IMPORT LIBRARIES
 from __future__ import annotations
-from typing import Tuple
+from typing import Tuple, Union, Mapping
 import os
 import numpy as np
 from scipy import io as spio
 from scipy.signal import firwin2, convolve, hilbert
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, uniform_filter, gaussian_filter, median_filter
+import cv2
 from .load_data_utils import LinearSystemParam
 from .recon_iq_utils import Apodization, Coherence
 from tqdm import tqdm
@@ -49,7 +50,6 @@ def _ch2sc_us_batch(mat: dict, info: LinearSystemParam, aligned_samples: int) ->
     Reconstruction = Reconstruction[:, :aligned_samples, :].transpose(0,2,1)  # (aligned_samples, N_ch, N_sc)
     
     return Reconstruction
-
 
 def _process_scanline(Reconstruction: np.ndarray,
                       RxMux: np.ndarray,
@@ -110,18 +110,27 @@ def _process_scanline(Reconstruction: np.ndarray,
     if np.any(above_mask):
         rf_tmp[above_mask] = 0.0
 
-    h_aper_size = (d_sample[:, None] / info.RxFnum) * 0.5               # (data_total1, 1)
+    # h_aper_size = (d_sample[:, None] / info.RxFnum) * 0.5               # (data_total1, 1)
+    # half_rx_ch = float(info.half_rx_ch)
+
+    # mask_large = (h_aper_size >= half_rx_ch)                           # bool (data_total1, 1)
+    # x_b = x[None, :]
+    # h_safe = np.where(h_aper_size > 0.0, h_aper_size, np.inf)
+    # Rx_apod_idx = np.empty((h_aper_size.shape[0], x_b.shape[1]), dtype=np.float64)
+    # Rx_apod_idx[mask_large[:, 0], :] = x_b[mask_large[:, 0], :] / half_rx_ch
+    # Rx_apod_idx[~mask_large[:, 0], :] = x_b[~mask_large[:, 0], :] / h_safe[~mask_large[:, 0], :]
+
+    # Rx_apo_r = (Rx_apod_idx < 1.0).astype(np.float64)
+    # Rx_apo_r = np.nan_to_num(Rx_apo_r, copy=False)
+
+    h_aper_size = (d_sample[:, None] / info.RxFnum) * 0.5
     half_rx_ch = float(info.half_rx_ch)
-
-    mask_large = (h_aper_size >= half_rx_ch)                           # bool (data_total1, 1)
     x_b = x[None, :]
-    h_safe = np.where(h_aper_size > 0.0, h_aper_size, np.inf)
-    Rx_apod_idx = np.empty((h_aper_size.shape[0], x_b.shape[1]), dtype=np.float64)
-    Rx_apod_idx[mask_large[:, 0], :] = x_b[mask_large[:, 0], :] / half_rx_ch
-    Rx_apod_idx[~mask_large[:, 0], :] = x_b[~mask_large[:, 0], :] / h_safe[~mask_large[:, 0], :]
-
+    h_safe = np.where(h_aper_size > 0.0, h_aper_size, np.inf)  # (data_total1, 1)
+    mask_large = (h_aper_size >= half_rx_ch)
+    Rx_apod_idx = np.where(mask_large, x_b / half_rx_ch, x_b / h_safe)
     Rx_apo_r = (Rx_apod_idx < 1.0).astype(np.float64)
-    Rx_apo_r = np.nan_to_num(Rx_apo_r, copy=False)
+    Rx_apo_r = np.nan_to_num(Rx_apo_r, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Place results into full-width RF matrix (data_total1, N_ch)
     RF_scanline_tofadjusted = np.zeros((data_total1, N_ch), dtype=np.float64)
@@ -214,3 +223,118 @@ def pe_das_linear(input_dir: str,
     RF_log_resized = zoom(RF_log, (zoom_z, zoom_x), order=1)  # bilinear interpolation
 
     return RF_Sum, RF_env_raw, RF_log_resized
+
+def _smooth_nakagami(
+    naka_img: np.ndarray,
+    us_img: np.ndarray = None,
+    guided_radius: int = 8,
+    guided_eps: float = 0.01,
+):
+    # normalize inputs to float32 and scale to 0..1 to keep parameters stable
+    def _norm01(img):
+        img = img.astype(np.float32, copy=False)
+        mn, mx = np.nanmin(img), np.nanmax(img)
+        if mx <= mn:
+            return np.zeros_like(img)
+        return (img - mn) / (mx - mn)
+
+    naka = _norm01(naka_img)
+    guide = _norm01(us_img) if us_img is not None else naka
+    guided = cv2.ximgproc.guidedFilter(guide.astype(np.float32), naka.astype(np.float32), radius=guided_radius, eps=float(guided_eps))
+    guided = gaussian_filter(guided, sigma=2.0)
+    return guided.astype(np.float32)
+
+def _clip01(img):
+    img = np.asarray(img, dtype=np.float32)
+    img = img - np.nanmin(img)
+    mx = np.nanmax(img)
+    if mx > 0:
+        img = img / mx
+    else:
+        img = np.zeros_like(img)
+    return img
+
+def _despeckle_lee(us_img, win_size=7, var_noise=None):
+    I = _clip01(us_img).astype(np.float32)
+    if win_size % 2 == 0:
+        win_size += 1
+
+    # local mean and variance via box filter
+    kernel = (win_size, win_size)
+    mean = cv2.boxFilter(I, ddepth=-1, ksize=kernel, normalize=True, borderType=cv2.BORDER_REFLECT)
+    mean_sq = cv2.boxFilter(I * I, ddepth=-1, ksize=kernel, normalize=True, borderType=cv2.BORDER_REFLECT)
+    var_local = mean_sq - mean * mean
+    var_local = np.maximum(var_local, 0.0)
+
+    if var_noise is None:
+        # estimate noise variance as the median of local variances (robust)
+        var_noise = np.median(var_local[var_local > 0]) if np.any(var_local > 0) else 1e-6
+
+    # compute Lee weight
+    W = var_local / (var_local + var_noise)
+    out = mean + W * (I - mean)
+    return _clip01(out).astype(np.float32)
+
+def nakagami_linear(R_env_raw: np.ndarray,
+                    info: LinearSystemParam,
+                    N_repeat: int = 7)-> np.ndarray:
+    '''
+    Nakagami parameter estimation from RF envelope data.
+    R_env_raw: (N_focus, N_sc) beamformed RF envelope data
+    N_repeat: number of different window sizes to use for local statistics
+    Returns: (N_focus, N_sc) Nakagami parameter map
+    '''
+    N_focus, N_sc = R_env_raw.shape
+    pulse_length = info.c / info.fc
+    pitch = info.pitch
+    pixel_d = info.pixel_d
+    naka_stack = np.full((N_focus, N_sc, N_repeat), np.nan, dtype=np.float32)
+    for i_repeat in tqdm(range(N_repeat), desc = "Nakagami Estimation", leave=False):
+        w = max(1 , ((i_repeat+1)//2)) * 0.5e-3
+        h = (i_repeat + 2) * pulse_length
+        
+        w_roi = int(round(w / pitch))
+        w_roi = max(1, w_roi)  # at least 1 sample width
+        if (w_roi % 2) == 0: w_roi += 1
+
+        h_roi = int(round(h / pixel_d))
+        h_roi = max(1, h_roi)
+        if (h_roi % 2) == 0: h_roi += 1
+        size_tuple = (h_roi, w_roi)
+
+        # compute local second and fourth raw moment (i.e. mean of r^2 and r^4)
+        r2_local_mean = uniform_filter(R_env_raw ** 2, size=size_tuple, mode="reflect")
+        r4_local_mean = uniform_filter(R_env_raw ** 4, size=size_tuple, mode="reflect")
+        m2 = r2_local_mean
+        m4 = r4_local_mean
+        denom = (m4 - m2 * m2)
+
+        invalid_mask = denom <= 0
+        k_map = np.empty_like(denom, dtype=np.float32)
+        k_map[invalid_mask] = np.nan
+        safe_denom = denom.copy()
+        safe_denom[invalid_mask] = np.nan  # will produce nan in division
+        k_map[~invalid_mask] = (m2[~invalid_mask] * m2[~invalid_mask]) / safe_denom[~invalid_mask]
+        naka_stack[:, :, i_repeat] = k_map
+    
+    naka_avg = np.nanmedian(naka_stack, axis=2)
+    tgc_nakagami = 1.0 - 2.0e-4 * (np.arange(1, naka_avg.shape[0] + 1))
+    naka_avg = naka_avg * tgc_nakagami[:, None]
+
+    RF_env_norm = R_env_raw / np.max(R_env_raw) if np.max(R_env_raw) != 0 else R_env_raw
+    dB_US = 75
+    min_dB = 10 ** (-dB_US / 20.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        RF_log = (20.0 / dB_US) * np.log10(np.maximum(RF_env_norm, 1e-20)) + 1.0
+    RF_log[RF_env_norm < min_dB] = 0.0
+    RF_log = _despeckle_lee(RF_log, win_size=9)
+    naka_avg = _smooth_nakagami(naka_avg, RF_log, guided_radius=8, guided_eps=0.01)
+
+    xz_ratio = info.FOV / np.max(info.d_sample)
+    Lx = 4 * N_sc
+    Lz = int(round(Lx / xz_ratio)) if xz_ratio != 0 else naka_avg.shape[0]
+    # Use scipy.ndimage.zoom to resize to (Lz, Lx)
+    zoom_z = Lz / naka_avg.shape[0] if naka_avg.shape[0] > 0 else 1.0
+    zoom_x = Lx / naka_avg.shape[1] if naka_avg.shape[1] > 0 else 1.0
+    naka_resized = zoom(naka_avg, (zoom_z, zoom_x), order=1)
+    return naka_resized, naka_resized

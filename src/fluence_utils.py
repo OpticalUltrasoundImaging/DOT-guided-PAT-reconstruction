@@ -331,7 +331,6 @@ def _map_pos_to_phys_and_voxel_center_cm(pos, shape, voxel_size_cm):
     z_v = (z_phys + depth_z/2.0)/dz - 0.5
     return (x_phys, y_phys, z_phys), (z_v, y_v, x_v)
 
-
 def compute_phi_heterogeneous(mu_a_cm, mu_sp_cm,
                               voxel_size_cm=(0.1, 0.1, 0.1),
                               fiber_positions=[(+0.5, +0.9), (+0.5, -0.9), (-0.5, +0.9), (-0.5, -0.9)],
