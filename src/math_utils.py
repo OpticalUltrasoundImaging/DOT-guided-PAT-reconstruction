@@ -101,7 +101,7 @@ def generate_G(t, z_grid, x_grid, element_centers, c, ele_width, ele_height, Bt,
 
 @njit(parallel=True)
 def compute_h_numba(t, z_grid, x_grid, element_centers,
-                    ele_width, ele_height, c_val, y_plane=0.0):
+                    ele_width, ele_height, c_val, y_plane=0.0) -> np.ndarray:
     """
     Numba-jitted computation of h(t, element, voxel) including:
       - element width and height fractional overlap
@@ -123,8 +123,8 @@ def compute_h_numba(t, z_grid, x_grid, element_centers,
     Ne = element_centers.size
 
     # ravel grids
-    zs = z_grid.ravel().astype(np.float32)
-    xs = x_grid.ravel().astype(np.float32)
+    zs = z_grid.ravel()
+    xs = x_grid.ravel()
     ys = np.full(Nvox, y_plane, dtype=np.float32)
 
     # precompute element edges
@@ -133,7 +133,7 @@ def compute_h_numba(t, z_grid, x_grid, element_centers,
     ye_top = ele_height / 2.0
     ye_bottom = -ele_height / 2.0
 
-    h = np.zeros((Nt, Ne, Nvox), dtype=np.float32)
+    h = np.zeros((Nt, Ne, Nvox), np.float32)
 
     # Loop in parallel over voxels
     for ivox in prange(Nvox):
@@ -203,7 +203,8 @@ def generate_G_from_h_fft(h: np.ndarray,
                           Bt: np.ndarray,
                           Bt_deriv: np.ndarray,
                           t: np.ndarray,
-                          normalize: bool = False) -> np.ndarray:
+                          normalize: bool = False,
+                          ) -> np.ndarray:
     Nt, Ne, Nvox = h.shape
     h_mat = h.reshape(Nt, Ne * Nvox, order='F')  # columns = ie*Nvox + ivox
 
@@ -212,8 +213,8 @@ def generate_G_from_h_fft(h: np.ndarray,
     nfft = _next_pow2(Lfull)
 
     H_fft = np.fft.rfft(h_mat, n=nfft, axis=0)         # (k, ncols)
-    Bt_fft = np.fft.rfft(Bt, n=nfft)
-    Bt_deriv_fft = np.fft.rfft(Bt_deriv, n=nfft)
+    Bt_fft = np.fft.rfft(Bt, n=nfft)             # (k,)
+    Bt_deriv_fft = np.fft.rfft(Bt_deriv, n=nfft) # (k,)
 
     S_full = np.fft.irfft(Bt_fft[:, None] * H_fft, n=nfft, axis=0)[:Lfull, :]
     Sderiv_full = np.fft.irfft(Bt_deriv_fft[:, None] * H_fft, n=nfft, axis=0)[:Lfull, :]
@@ -228,7 +229,6 @@ def generate_G_from_h_fft(h: np.ndarray,
     # multiply derivative term by t (time axis), broadcasting along columns
     Sderiv = Sderiv * t[:, None]
     Ssum = S - Sderiv  # (Nt, Ne*Nvox)
-
     if normalize:
         maxabs = np.max(np.abs(Ssum), axis=0)
         maxabs[maxabs == 0] = 1.0
@@ -236,7 +236,7 @@ def generate_G_from_h_fft(h: np.ndarray,
 
     # reshape back to (Nt, Ne, Nvox)
     S3 = Ssum.reshape(Nt, Ne, Nvox, order='F')
-    L_end_artifact = 30
+    L_end_artifact = 32
     S3[-L_end_artifact:, :, :] = 0.0  # zero out end artifacts due to FFT circular conv
     # permute to (Ne, Nt, Nvox) then flatten to (Ne*Nt, Nvox) with row = ie*Nt + it
     S_perm = np.transpose(S3, (1, 0, 2))

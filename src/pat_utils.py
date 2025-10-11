@@ -9,8 +9,8 @@ from scipy import io as spio
 from scipy.signal import firwin2, convolve, hilbert
 from scipy.ndimage import zoom, gaussian_filter1d
 from .load_data_utils import LinearSystemParam
-from .recon_iq_utils import Apodization, Coherence
-from .math_utils import generate_G, compute_h_numba, generate_G_from_h_fft
+from .recon_iq_utils import Apodization, Coherence, PATInverseSolver
+from .math_utils import compute_h_numba, generate_G_from_h_fft
 from tqdm import tqdm
 
 F_LO_CUTOFF = 0.04
@@ -167,13 +167,12 @@ def _process_scanline(Reconstruction: np.ndarray,
 
     return RF_scanline_tofadjusted, active_ch.tolist()
 
-
 def pa_das_linear(input_dir: str, 
                   info: LinearSystemParam, 
                   apod_method: str, 
                   coherence_method: str, 
                   channel_file: str = '1_layer0_idx1_CUSTOMDATA_RF.mat', 
-                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                  ) -> Tuple[np.ndarray, np.ndarray]:
 
     # Build path to channel file
     channel_path = os.path.join(input_dir, channel_file)
@@ -284,7 +283,8 @@ def _calculate_time_axis(bbox_cm: Tuple[float, float, float, float],
     t = np.arange(Nt) / info.fs
     return t
 
-def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling_factor: Tuple[float, float], info: LinearSystemParam, verbose=False):
+def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling_factor: Tuple[float, float], info: LinearSystemParam, 
+                            verbose=False):
     x_min_cm , x_max_cm , z_min_cm , z_max_cm = bbox_cm
     scaling_factor_x , scaling_factor_z = scaling_factor
     x_min, x_max = x_min_cm / 100.0, x_max_cm / 100.0
@@ -303,7 +303,7 @@ def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling
         print(f"Imaging grid: x from {x_min*100:.1f} cm to {x_max*100:.1f} cm with dx={dx*100:.2f} cm ({x_grid.size} points)")
         print(f"              z from {z_min*100:.1f} cm to {z_max*100:.1f} cm with dz={dz*100:.2f} cm ({z_grid.size} points)")
     Z, X = np.meshgrid(z_grid, x_grid, indexing='ij')
-    t_axis = _calculate_time_axis(bbox_cm, x_el, info, buffer_cm=1e-2)
+    t_axis = _calculate_time_axis(bbox_cm, x_el, info, buffer_cm=0.1)
     nt = t_axis.size
     if verbose:
         print(f"Time axis: {nt} points, from {t_axis[0]*1e6:.2f} us to {t_axis[-1]*1e6:.2f} us")
@@ -326,7 +326,8 @@ def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling
                         float(info.ele_width),
                         float(info.ele_height),
                         float(info.c), 
-                        float(0.0))
+                        float(0.0),
+                        )
 
     G = generate_G_from_h_fft(h, Bt, Bt_deriv, t_axis, normalize=False)
     meta = {
@@ -338,4 +339,101 @@ def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling
     if verbose:
         print(f"System matrix generated. G has shape {G.shape} (dtype={G.dtype})")
     return G, meta
-# %%
+
+def _load_pa_raw(input_dir: str, 
+                channel_file: str = '1_layer0_idx1_CUSTOMDATA_RF.mat',
+                verbose: bool = False,
+                ) -> np.ndarray:
+    channel_path = os.path.join(input_dir, channel_file)
+    if not os.path.isfile(channel_path):
+        raise FileNotFoundError(f"Channel file not found: {channel_path}")
+
+    mat = spio.loadmat(channel_path, squeeze_me=True, struct_as_record=False)
+    data_raw = mat["AdcData_frame000"]  # (N_ch per acquisition, samples, frames)
+    if verbose:
+        print(f"Raw data shape: {data_raw.shape}, dtype={data_raw.dtype}")
+    AlignedSampleNum = int(getattr(mat.get('AlignedSampleNum', None), 'item', mat.get('AlignedSampleNum', None)))
+    frames = data_raw.shape[2]
+    if frames < N32SEG:
+        raise ValueError(f"Not enough frames ({frames}) for N32seg={N32SEG}")
+    
+    n_groups = frames // N32SEG
+    if n_groups < 1:
+        raise ValueError("Not enough full groups of frames to average (need at least one group)")
+    
+    frames_use = n_groups * N32SEG
+    if frames_use != frames:
+        data_raw = data_raw[:, :, :frames_use]
+
+    data_rg = data_raw.reshape(32, data_raw.shape[1], n_groups, N32SEG)
+    tem = data_rg.sum(axis=2)
+    # divide by number of groups to get per-cycle-position averages
+    data_avg = tem / float(n_groups)
+    p = data_avg  # (32, samples, 6)
+    A = 0.5 * (p[:, :, 1] + p[:, :, 5])   # shape (N_ch, samples)
+    B = p[:, :, 2]
+    C = p[:, :, 3]
+    D = 0.5 * (p[:, :, 0] + p[:, :, 4])
+    data_combined = np.concatenate([A, B, C, D], axis=0)  # (32*4, samples)
+    # truncate or pad to AlignedSampleNum
+    if data_combined.shape[1] >= AlignedSampleNum:
+        data_final = data_combined[:, :AlignedSampleNum]
+    else:
+        pad_width = AlignedSampleNum - data_combined.shape[1]
+        data_final = np.pad(data_combined, ((0, 0), (0, pad_width)), mode="constant", constant_values=0.0)
+    if verbose:
+        print(f"Data after frame averaging and combining: {data_final.shape}, dtype={data_final.dtype}")
+    return data_final
+
+def pa_inverse_recon(input_dir: str,
+                     info: LinearSystemParam,
+                     recon_bbox_cm: Tuple[float, float, float, float],
+                     scaling_factor: Tuple[float, float],
+                     solver_method: str = 'lsqr',
+                     normalize_G: bool = True,
+                     channel_file: str = '1_layer0_idx1_CUSTOMDATA_RF.mat',
+                     verbose: bool = False) -> np.ndarray:
+    G, G_meta = generate_imaging_matrix(recon_bbox_cm, scaling_factor, info, verbose=True)
+    if verbose:
+        print("System matrix generated.")
+        print(f"Imaging grid shape: Z {G_meta['Z'].shape[0]}, X {G_meta['Z'].shape[1]}")
+    if normalize_G:
+        G_norms = np.linalg.norm(G, axis=0)
+        G_norms[G_norms == 0] = 1.0
+        G /= G_norms
+        if verbose:
+            print("System matrix normalized.")
+    t_axis_recon = G_meta['t']
+    t0 = int(t_axis_recon[0]*info.fs)
+    Nt = t_axis_recon.size
+
+    pa_raw = _load_pa_raw(input_dir, channel_file, verbose=False) # (N_ELEMENTS, AlignedSampleNum)
+    f_lo_nodes = [0.0, F_LO_CUTOFF, F_LO_CUTOFF, 1.0]
+    m_lo_nodes = [0.0, 0.0, 1.0, 1.0]
+    DC_cancel = firwin2(65, f_lo_nodes, m_lo_nodes)
+    f_hi_nodes = [0.0, F_HI_CUTOFF, F_HI_CUTOFF, 1.0]
+    m_hi_nodes = [1.0, 1.0, 0.0, 0.0]
+    HFN_cancel = firwin2(33, f_hi_nodes, m_hi_nodes)
+    pa_raw = convolve(pa_raw, DC_cancel[:, None], mode='same', method='auto')
+    pa_raw = convolve(pa_raw, HFN_cancel[:, None], mode='same', method='auto')
+    pa_raw = pa_raw[:, t0:t0+Nt]
+    pa_raw_flatten = pa_raw.flatten(order='C')  # (N_ELEMENTS*Nt,)
+    if verbose:
+        print("Raw PA data loaded and preprocessed.")
+
+    solver = PATInverseSolver(G, pa_raw_flatten)
+    if verbose:
+        print("Starting reconstruction...")
+    x_recon = solver.reconstruct(method=solver_method)
+    if verbose:
+        print("Reconstruction completed.")
+    
+    if normalize_G:
+        x_recon *= G_norms
+    x_recon = x_recon.reshape(G_meta['Z'].shape, order='C')
+    x_recon = abs(hilbert(x_recon, axis=0))
+    return x_recon, G_meta
+
+
+
+

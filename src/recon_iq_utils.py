@@ -1,8 +1,135 @@
 import numpy as np
+from typing import Optional, Tuple
 from scipy.signal import convolve, windows, firwin2
 from scipy.ndimage import uniform_filter1d
+from scipy.sparse.linalg import lsqr, LinearOperator, cg
+from scipy.optimize import lsq_linear
 from numpy.lib.stride_tricks import as_strided
 from .load_data_utils import LinearSystemParam
+from tqdm import tqdm
+
+class PATInverseSolver:
+    def __init__(self, G: np.ndarray, RF_data: np.ndarray):
+        self.G = G
+        self.RF_data = RF_data
+        self.mu = None
+        self.M, self.N = G.shape
+
+    def _solve_lsqr(self, atol: float = 1e-6, btol: float = 1e-6, iter_lim: int = 1000, damp: float = 0.0) -> np.ndarray:
+        res = lsqr(self.G, self.RF_data, atol=atol, btol=btol, iter_lim=iter_lim, damp=damp)
+        x = res[0]
+        self.mu = x
+        return x
+    
+    def _solve_tikhonov(self, lambda_reg: float = 1e-3, tol: float = 1e-6, maxiter: int = 500, x0: Optional[np.ndarray] = None) -> np.ndarray:
+        if x0 is None:
+            x0 = np.zeros(self.N, dtype=np.float32)
+
+        def _A_matvec(x):
+            if isinstance(self.G, LinearOperator):
+                Gx = self.G.matvec(x)
+            else:
+                Gx = self.G.dot(x)
+            if isinstance(self.G, LinearOperator):
+                GTGx = self.G.rmatvec(Gx)
+            else:
+                GTGx = self.G.T.dot(Gx)
+            return GTGx + lambda_reg * x
+
+        A = LinearOperator((self.N, self.N), matvec=_A_matvec, dtype=np.float64)
+        rhs = (self.G.T.dot(self.RF_data)) if not isinstance(self.G, LinearOperator) else self.G.rmatvec(self.b)
+        x, info = cg(A, rhs, x0=x0, maxiter=maxiter, tol=tol)
+        if info != 0:
+            # info>0: no convergence in maxiter, info<0: illegal input
+            pass
+        self.mu = x
+        return x
+    
+    def _solve_nnls(self, bounds: Tuple[float, float] = (0.0, np.inf), max_iter: int = 2000, tol: float = 1e-6) -> np.ndarray:
+        res = lsq_linear(self.G, self.RF_data, bounds=bounds, method='trf', max_iter=max_iter, tol=tol, verbose=1)
+        self.mu = res.x
+        return res.x
+    
+    def _estimate_lipschitz(self, num_iter: int = 20) -> float:
+        """
+        Estimate Lipschitz constant L = ||G||_2^2 via power iteration on G^T G.
+        """
+        n = self.n
+        x = np.random.randn(n).astype(np.float64)
+        for _ in range(num_iter):
+            if isinstance(self.G, LinearOperator):
+                Gx = self.G.matvec(x)
+                GTGx = self.G.rmatvec(Gx)
+            else:
+                Gx = self.G.dot(x)
+                GTGx = self.G.T.dot(Gx)
+            norm = np.linalg.norm(GTGx)
+            if norm == 0:
+                return 1.0
+            x = GTGx / norm
+        # Rayleigh quotient approx for largest eigenvalue of G^T G
+        if isinstance(self.G, LinearOperator):
+            Gx = self.G.matvec(x)
+            GTGx = self.G.rmatvec(Gx)
+        else:
+            Gx = self.G.dot(x)
+            GTGx = self.G.T.dot(Gx)
+        eig_approx = np.dot(x, GTGx)
+        return float(eig_approx) if eig_approx > 0 else 1.0
+    
+    def _solve_fista_l1(self, lam: float = 1e-3, maxiter: int = 500, L0: Optional[float] = None, nonneg: bool = False, x0: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        L1-regularized least squares via FISTA:
+            min_x 0.5||G x - b||_2^2 + lam * ||x||_1
+        """
+        if x0 is None:
+            x = np.zeros(self.N, dtype=np.float32)
+        else:
+            x = x0.astype(np.float32).copy()
+        yk = x.copy()
+        t_k = 1.0
+
+        # compute Lipschitz constant estimate L = ||G||_2^2 (approx). We'll use power iteration if not provided.
+        if L0 is None:
+            L = self._estimate_lipschitz(num_iter=20)
+        else:
+            L = float(L0)
+        invL = 1.0 / L
+
+        for k in tqdm(range(maxiter), desc="FISTA iterations"):
+            # gradient = G^T (G yk - b)
+            Gy = (self.G.dot(yk) if not isinstance(self.G, LinearOperator) else self.G.matvec(yk))
+            grad = (self.G.T.dot(Gy - self.b) if not isinstance(self.G, LinearOperator) else self.G.rmatvec(Gy - self.b))
+
+            x_next = yk - invL * grad
+            # soft-threshold
+            thresh = lam * invL
+            # soft-threshold operator
+            x_next = np.sign(x_next) * np.maximum(np.abs(x_next) - thresh, 0.0)
+            if nonneg:
+                x_next = np.maximum(x_next, 0.0)
+
+            t_next = (1.0 + np.sqrt(1.0 + 4.0 * t_k * t_k)) / 2.0
+            yk = x_next + ((t_k - 1.0) / t_next) * (x_next - x)
+            x = x_next
+            t_k = t_next
+
+        self.mu = x
+        return x
+    
+    def reconstruct(self, method: str = 'pseudoinverse', **kwargs) -> np.ndarray:
+        method = method.lower()
+        if method == 'pseudoinverse' or method == 'lsqr':
+            return self._solve_lsqr(**kwargs)
+        elif method == 'tikhonov' or method == 'l2' or method == 'ridge':
+            return self._solve_tikhonov(**kwargs)
+        elif method == 'nnls' or method == 'nonnegative' or method == 'nonneg':
+            return self._solve_nnls(**kwargs)
+        elif method == 'fista' or method == 'l1' or method == 'lasso' or method == 'sparse':
+            return self._solve_fista_l1(**kwargs)
+        else:
+            raise ValueError("Unknown method: choose 'lsqr','l2','nonneg','l1'.")
+    
 
 class Apodization:
     def __init__(self, RF_scanline_tofadjusted: np.ndarray, active_ch: np.ndarray, info: LinearSystemParam):
