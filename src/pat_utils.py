@@ -200,7 +200,7 @@ def pa_das_linear(input_dir: str,
     # Prepare outputs
     RF_Sum = np.zeros((data_total1, N_sc), dtype=np.float64)
     d_sample = np.asarray(info.d_sample)
-    for sc in tqdm(range(N_sc), desc='BEAMFORMING',leave=False):
+    for sc in tqdm(range(N_sc), desc='PA BEAMFORMING',leave=False):
         RF_scanline_tofadjusted , active_ch = _process_scanline(Reconstruction, RxMux, sc, info, d_sample, data_total1)
         if len(active_ch) == 0:
             continue
@@ -392,7 +392,7 @@ def pa_inverse_recon(input_dir: str,
                      solver_method: str = 'lsqr',
                      normalize_G: bool = True,
                      channel_file: str = '1_layer0_idx1_CUSTOMDATA_RF.mat',
-                     verbose: bool = False) -> np.ndarray:
+                     verbose: bool = True) -> np.ndarray:
     G, G_meta = generate_imaging_matrix(recon_bbox_cm, scaling_factor, info, verbose=True)
     if verbose:
         print("System matrix generated.")
@@ -421,7 +421,7 @@ def pa_inverse_recon(input_dir: str,
     if verbose:
         print("Raw PA data loaded and preprocessed.")
 
-    solver = PATInverseSolver(G, pa_raw_flatten)
+    solver = PATInverseSolver(G, pa_raw_flatten.astype(np.float32))
     if verbose:
         print("Starting reconstruction...")
     x_recon = solver.reconstruct(method=solver_method)

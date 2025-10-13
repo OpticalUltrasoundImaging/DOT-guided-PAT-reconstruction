@@ -1,9 +1,11 @@
 import numpy as np
+from numpy.linalg import norm
 from typing import Optional, Tuple
 from scipy.signal import convolve, windows, firwin2
 from scipy.ndimage import uniform_filter1d
 from scipy.sparse.linalg import lsqr, LinearOperator, cg
 from scipy.optimize import lsq_linear
+from scipy.linalg import cho_factor, cho_solve
 from numpy.lib.stride_tricks import as_strided
 from .load_data_utils import LinearSystemParam
 from tqdm import tqdm
@@ -14,6 +16,7 @@ class PATInverseSolver:
         self.RF_data = RF_data
         self.mu = None
         self.M, self.N = G.shape
+        self.stripe_width_vox = 10
 
     def _solve_lsqr(self, atol: float = 1e-6, btol: float = 1e-6, iter_lim: int = 1000, damp: float = 0.0) -> np.ndarray:
         res = lsqr(self.G, self.RF_data, atol=atol, btol=btol, iter_lim=iter_lim, damp=damp)
@@ -21,27 +24,35 @@ class PATInverseSolver:
         self.mu = x
         return x
     
-    def _solve_tikhonov(self, lambda_reg: float = 1e-3, tol: float = 1e-6, maxiter: int = 500, x0: Optional[np.ndarray] = None) -> np.ndarray:
-        if x0 is None:
-            x0 = np.zeros(self.N, dtype=np.float32)
+    def _solve_lsqr_tikhonov(G_sub: np.ndarray, b: np.ndarray, lambda_reg: float = 1e-3, iter_lim:int=100):
+        damp = np.sqrt(lambda_reg)
+        res = lsqr(G_sub.astype(np.float32), b.astype(np.float32), damp=damp, iter_lim=iter_lim)
+        x = res[0].astype(np.float32)
+        return x
+    
+    def _solve_tikhonov(self, lambda_reg: float = 5e-3, maxiter: int = 200, x0: Optional[np.ndarray] = None) -> np.ndarray:
+        '''
+        G = self.G
+        b = self.RF_data
+        N = self.N
+        L_strip = self.stripe_width_vox
+        mu = np.zeros(N, dtype=np.float32) if x0 is None else x0.astype(np.float32, copy=False)
+        colnorms = np.linalg.norm(G, axis=0)
+        colnorms[colnorms == 0] = 1.0
 
-        def _A_matvec(x):
-            if isinstance(self.G, LinearOperator):
-                Gx = self.G.matvec(x)
-            else:
-                Gx = self.G.dot(x)
-            if isinstance(self.G, LinearOperator):
-                GTGx = self.G.rmatvec(Gx)
-            else:
-                GTGx = self.G.T.dot(Gx)
-            return GTGx + lambda_reg * x
-
-        A = LinearOperator((self.N, self.N), matvec=_A_matvec, dtype=np.float64)
-        rhs = (self.G.T.dot(self.RF_data)) if not isinstance(self.G, LinearOperator) else self.G.rmatvec(self.b)
-        x, info = cg(A, rhs, x0=x0, maxiter=maxiter, tol=tol)
-        if info != 0:
-            # info>0: no convergence in maxiter, info<0: illegal input
-            pass
+        starts = list(range(0,N,L_strip))
+        for s in tqdm(starts , desc="Tikhonov stripes"):
+            e = min(N, s + L_strip)
+            G_sub = G[:, s:e].astype(np.float32)
+            G_sub_norm = G_sub / colnorms[s:e][None, :]
+            x_sub = _solve_lsqr_tikhonov(G_sub_norm, b, lambda_reg = lambda_reg, iter_lim = maxiter)
+            # denormalize
+            mu[s:e] = x_sub / colnorms[s:e]
+        self.mu = mu
+        '''
+        damp = np.sqrt(lambda_reg)
+        res = lsqr(self.G, self.RF_data, atol=1e-6, btol=1e-6, iter_lim=maxiter, damp=damp)
+        x = res[0]
         self.mu = x
         return x
     
@@ -77,16 +88,119 @@ class PATInverseSolver:
         eig_approx = np.dot(x, GTGx)
         return float(eig_approx) if eig_approx > 0 else 1.0
     
+    def _soft_threshold(x: np.ndarray, thresh: float) -> np.ndarray:
+        return np.sign(x) * np.maximum(np.abs(x) - thresh, 0.0)
+    
+    def _solve_l1(self,
+                  lambda_reg: float = 5e-3,
+                  rho: float = 1.0,
+                  max_admm_iters: int = 30,
+                  lsqr_maxiter: int = 20,
+                  abstol: float = 1e-4,
+                  reltol: float = 1e-3,
+                  verbose: bool = True,
+                  x0: Optional[np.ndarray] = None) -> np.ndarray:
+        G = self.G.astype(np.float32, copy=False)
+        b = self.RF_data.astype(np.float32, copy=False)
+
+        is_op = isinstance(G, LinearOperator)
+        if not is_op:
+            G = np.asarray(G, dtype=np.float32)
+            m, n = G.shape
+            def matvec_G(v): return G.dot(v)
+            def rmatvec_G(w): return G.T.dot(w)
+        else:
+            m, n = G.shape
+            def matvec_G(v): return G.matvec(v).astype(np.float32)
+            if hasattr(G, 'rmatvec'):
+                def rmatvec_G(w): return G.rmatvec(w).astype(np.float32)
+            else:
+                raise ValueError("LinearOperator G must provide rmatvec for ADMM LSQR solver.")
+
+        # initial x, z, u (scaled dual variable u)
+        if x0 is None:
+            x = np.zeros(n, dtype=np.float32)
+        else:
+            x = np.asarray(x0, dtype=np.float32)
+        z = x.copy()
+        u = np.zeros_like(x, dtype=np.float32)  # scaled dual variable: u = y / rho
+
+        sqrt_rho = np.float32(np.sqrt(rho))
+        lam_over_rho = np.float32(lambda_reg / rho)
+
+        # precompute operator for augmented system: A_aug matvec and rmatvec
+        # A_aug: (m + n) x n  ; matvec(x) -> [Gx; sqrt(rho)*x]
+        def A_aug_matvec(v: np.ndarray) -> np.ndarray:
+            return np.concatenate([matvec_G(v).astype(np.float32),
+                                (sqrt_rho * v).astype(np.float32)]).astype(np.float32)
+
+        # rmatvec(y_aug) = G^T y0 + sqrt(rho) * y1, where y_aug = [y0; y1]
+        def A_aug_rmatvec(y_aug: np.ndarray) -> np.ndarray:
+            y0 = y_aug[:m].astype(np.float32)
+            y1 = y_aug[m:].astype(np.float32)
+            return (rmatvec_G(y0) + sqrt_rho * y1).astype(np.float32)
+
+        A_aug = LinearOperator((m + n, n), matvec=A_aug_matvec, rmatvec=A_aug_rmatvec, dtype=np.float32)
+        b_norm = norm(b)
+        if b_norm == 0:
+            b_norm = 1.0
+
+        # ADMM iterations
+        for k in range(max_admm_iters):
+            # x-update: solve min_x 0.5||Gx - b||^2 + (rho/2)||x - z + u||^2 via LSQR on augmented system
+            rhs_aug = np.concatenate([b, sqrt_rho * (z - u)]).astype(np.float32)
+
+            # Use lsqr with the LinearOperator A_aug; limit iterations for speed
+            # lsqr returns tuple; solution is first element
+            lsqr_res = lsqr(A_aug, rhs_aug, atol=1e-6, btol=1e-6, iter_lim=lsqr_maxiter)
+            x_new = np.asarray(lsqr_res[0], dtype=np.float32)
+
+            # z-update: soft-thresholding on x_new + u
+            x_plus_u = x_new + u
+            z_new = np.sign(x_plus_u) * np.maximum(np.abs(x_plus_u) - lam_over_rho, 0.0)
+            z_new = np.maximum(z_new, 0.0, dtype=np.float32)
+            u_new = u + (x_new - z_new)
+
+            # compute diagnostics
+            prim_res = norm(x_new - z_new)                         # primal residual ||x - z||
+            dual_res = rho * norm(z_new - z)                      # dual residual rho ||z - z_prev||
+            # objective: 0.5||Gx - b||^2 + lambda ||z||
+            r = matvec_G(x_new) - b
+            obj = 0.5 * float(np.dot(r.astype(np.float32), r.astype(np.float32))) + lambda_reg * float(np.sum(np.abs(z_new)))
+            # update variables
+            x , z , u = x_new , z_new , u_new
+            # stopping criterion
+            eps_primal = np.sqrt(n) * abstol + reltol * max(norm(x), norm(z))
+            eps_dual = np.sqrt(n) * abstol + reltol * norm(rho * u)
+            if verbose:
+                print(f"ADMM iter {k+1:3d}: obj={obj:.6e}, prim_res={prim_res:.3e}, dual_res={dual_res:.3e}, eps_primal={eps_primal:.3e}, eps_dual={eps_dual:.3e}")
+
+            if prim_res <= eps_primal and dual_res <= eps_dual:
+                if verbose:
+                    print(f"Converged (ADMM iter {k+1}).")
+                break
+        self.mu = x
+        return x
+
     def _solve_fista_l1(self, lam: float = 1e-3, maxiter: int = 500, L0: Optional[float] = None, nonneg: bool = False, x0: Optional[np.ndarray] = None) -> np.ndarray:
         """
         L1-regularized least squares via FISTA:
             min_x 0.5||G x - b||_2^2 + lam * ||x||_1
         """
+        G = self.G.astype(np.float32, copy=False)
+        b = self.RF_data.astype(np.float32, copy=False)
         if x0 is None:
-            x = np.zeros(self.N, dtype=np.float32)
-        else:
-            x = x0.astype(np.float32).copy()
-        yk = x.copy()
+            try:
+                # Solve (G G^T) y = b  =>  x0 = G^T y
+                GGt = G @ G.T
+                GGt += np.eye(GGt.shape[0], dtype=np.float32) * np.float32(1e-6)
+                c, low = cho_factor(GGt, overwrite_a=True, check_finite=False)
+                y = cho_solve((c, low), b, check_finite=False)
+                x0 = G.T @ y
+            except np.linalg.LinAlgError:
+                x0 = G.T @ b
+            x0 = x0.astype(np.float32, copy=False)
+        yk = x0.copy()
         t_k = 1.0
 
         # compute Lipschitz constant estimate L = ||G||_2^2 (approx). We'll use power iteration if not provided.
@@ -126,7 +240,7 @@ class PATInverseSolver:
         elif method == 'nnls' or method == 'nonnegative' or method == 'nonneg':
             return self._solve_nnls(**kwargs)
         elif method == 'fista' or method == 'l1' or method == 'lasso' or method == 'sparse':
-            return self._solve_fista_l1(**kwargs)
+            return self._solve_l1(**kwargs)
         else:
             raise ValueError("Unknown method: choose 'lsqr','l2','nonneg','l1'.")
     

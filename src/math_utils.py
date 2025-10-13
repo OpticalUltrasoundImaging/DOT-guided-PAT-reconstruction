@@ -192,7 +192,7 @@ def compute_h_numba(t, z_grid, x_grid, element_centers,
 
                 frac = (overlap_x / ele_width) * (overlap_y / ele_height)
                 h[it, ie, ivox] = frac * inv_r * ct
-    return h
+    return h.astype(np.float32)
 
 def _next_pow2(n: int) -> int:
     if n <= 1:
@@ -229,6 +229,7 @@ def generate_G_from_h_fft(h: np.ndarray,
     # multiply derivative term by t (time axis), broadcasting along columns
     Sderiv = Sderiv * t[:, None]
     Ssum = S - Sderiv  # (Nt, Ne*Nvox)
+    Ssum = Ssum.astype(np.float32)
     if normalize:
         maxabs = np.max(np.abs(Ssum), axis=0)
         maxabs[maxabs == 0] = 1.0

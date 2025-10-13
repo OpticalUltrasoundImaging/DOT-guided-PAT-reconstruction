@@ -171,7 +171,6 @@ def pe_das_linear(input_dir: str,
 
     # Reconstruction shape (AlignedSampleNum, N_ch, Nsc)
     Reconstruction = _ch2sc_us_batch(mat, info, aligned_samples)
-    print(Reconstruction.shape)
 
     # Precompute DC cancellation FIR filter (fir2 equivalent)
     # MATLAB: f = [0 0.1 0.1 1]; m = [0 0 1 1]; DC_cancel = fir2(64,f,m)
@@ -182,7 +181,7 @@ def pe_das_linear(input_dir: str,
     # Prepare outputs
     RF_Sum = np.zeros((data_total1, N_sc), dtype=np.float64)
     d_sample = np.asarray(info.d_sample)
-    for sc in tqdm(range(N_sc), desc='BEAMFORMING',leave=False):
+    for sc in tqdm(range(N_sc), desc='US BEAMFORMING',leave=False):
         RF_scanline_tofadjusted , active_ch = _process_scanline(Reconstruction, RxMux, sc, info, DC_cancel, d_sample, data_total, data_total1)
         if len(active_ch) == 0:
             continue
