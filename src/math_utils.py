@@ -204,6 +204,7 @@ def generate_G_from_h_fft(h: np.ndarray,
                           Bt_deriv: np.ndarray,
                           t: np.ndarray,
                           normalize: bool = False,
+                          subsampling: bool = True,
                           ) -> np.ndarray:
     Nt, Ne, Nvox = h.shape
     h_mat = h.reshape(Nt, Ne * Nvox, order='F')  # columns = ie*Nvox + ivox
@@ -218,9 +219,6 @@ def generate_G_from_h_fft(h: np.ndarray,
 
     S_full = np.fft.irfft(Bt_fft[:, None] * H_fft, n=nfft, axis=0)[:Lfull, :]
     Sderiv_full = np.fft.irfft(Bt_deriv_fft[:, None] * H_fft, n=nfft, axis=0)[:Lfull, :]
-
-    # Now extract the 'same' portion (MATLAB conv(x,y,'same') returns center of full conv with length = len(x))
-    # For conv(Bt (len Nt), h (len Nt)) the 'same' result is indices centered on Bt: start = floor((Lfull - Nt)/2)
     start = (Lfull - Nt) // 2
     end = start + Nt
     S = S_full[start:end, :]           # (Nt, Ne*Nvox)
@@ -239,6 +237,8 @@ def generate_G_from_h_fft(h: np.ndarray,
     S3 = Ssum.reshape(Nt, Ne, Nvox, order='F')
     L_end_artifact = 32
     S3[-L_end_artifact:, :, :] = 0.0  # zero out end artifacts due to FFT circular conv
+    if subsampling:
+        S3 = 0.5*S3[::2,:,:] + 0.5*S3[1::2,:,:]
     # permute to (Ne, Nt, Nvox) then flatten to (Ne*Nt, Nvox) with row = ie*Nt + it
     S_perm = np.transpose(S3, (1, 0, 2))
     G2D = S_perm.reshape(Ne * Nt, Nvox, order='C')
