@@ -540,3 +540,326 @@ def compute_phi_heterogeneous(mu_a_cm, mu_sp_cm,
     info = {'solver': use_solver, 'cg_info': int(cg_info) if cg_info is not None else None}
 
     return phi, info
+
+def compute_phi_and_grad(mu_a_cm, 
+                         mu_sp_cm,
+                         voxel_size_cm=(0.1, 0.1, 0.1),
+                         fiber_positions=[(+0.5, +0.9), (+0.5, -0.9), (-0.5, +0.9), (-0.5, -0.9)],
+                         fiber_sigma_cm=0.03,
+                         tol=1e-8, maxiter=2000,
+                         use_pyamg=True, verbose=False,
+                         compute_grad=False,
+                         adjoint_rhs=None,
+                         dtype=np.float64):
+
+    if mu_a_cm.shape != mu_sp_cm.shape:
+        raise ValueError("mu_a_cm and mu_sp_cm must have same shape (Nz,Ny,Nx).")
+    Nz, Ny, Nx = mu_a_cm.shape
+    dx, dy, dz = voxel_size_cm
+    inv_dx2, inv_dy2, inv_dz2 = 1.0/(dx*dx), 1.0/(dy*dy), 1.0/(dz*dz)
+    eps = 1e-18
+    h_robin = 1.0
+
+    mu_a = np.asarray(mu_a_cm, dtype=dtype)
+    mu_s = np.asarray(mu_sp_cm, dtype=dtype)
+
+    # Diffusion coefficient D
+    D = 1.0 / (3.0 * np.maximum(mu_s + mu_a, 1e-12))    # (Nz,Ny,Nx)
+    dD = - (D * D) / 3.0 # derivative of D wrt mu_s
+
+    # construct source S (Nz,Ny,Nx)
+    width_x , width_y = Nx * dx , Ny * dy
+    x_coords_phys = (np.arange(Nx) + 0.5) * dx - width_x/2.0
+    y_coords_phys = (np.arange(Ny) + 0.5) * dy - width_y/2.0
+    X_phys = np.repeat(x_coords_phys[None, :], Ny, axis=0)    # (Ny, Nx)
+    Y_phys = np.repeat(y_coords_phys[:, None], Nx, axis=1)    # (Ny, Nx)
+
+    S = np.zeros((Nz, Ny, Nx), dtype=dtype)
+    for p in fiber_positions:
+        (x_phys, y_phys, _), (_, _, _) = _map_pos_to_phys_and_voxel_center_cm(p, (Nz,Ny,Nx), voxel_size_cm)
+        r2 = (X_phys - x_phys)**2 + (Y_phys - y_phys)**2
+        kernel2d = np.exp(-0.5 * r2 / (fiber_sigma_cm**2))
+        norm = np.sum(kernel2d) * dx * dy
+        if norm <= 0:
+            continue
+        surface_density = kernel2d / norm
+        S[0, :, :] += surface_density / dz
+
+    # Build face-centered D (harmonic means)
+    if Nx > 1:
+        D_x_face = 2.0 * (D[:, :, :-1] * D[:, :, 1:]) / (D[:, :, :-1] + D[:, :, 1:] + eps)
+    else:
+        D_x_face = np.zeros((Nz, Ny, 0), dtype=dtype)
+    if Ny > 1:
+        D_y_face = 2.0 * (D[:, :-1, :] * D[:, 1:, :]) / (D[:, :-1, :] + D[:, 1:, :] + eps)
+    else:
+        D_y_face = np.zeros((Nz, 0, Nx), dtype=dtype)
+    if Nz > 1:
+        D_z_face = 2.0 * (D[:-1, :, :] * D[1:, :, :]) / (D[:-1, :, :] + D[1:, :, :] + eps)
+    else:
+        D_z_face = np.zeros((0, Ny, Nx), dtype=dtype)
+
+    def idx(z,y,x): return (z * Ny + y) * Nx + x
+    N = Nz * Ny * Nx
+    rows = []; cols = []; vals = []
+    h_robin = 1.0
+    for z in range(Nz):
+        for y in range(Ny):
+            for x in range(Nx):
+                center = idx(z,y,x)
+                diag = mu_a_cm[z,y,x]  # cm^-1
+
+                # ------ X-direction ------
+                # face between (x) and (x+1) is indexed at x in D_x_face (valid for x=0..Nx-2)
+                if x+1 < Nx and Nx > 1:
+                    Dfp = D_x_face[z,y,x]
+                    coeff = Dfp / (dx*dx)
+                    rows.append(center); cols.append(idx(z,y,x+1)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    # use interior-adjacent face for right boundary (x == Nx-1)
+                    if Nx > 1:
+                        face_idx = min(x-1, Nx-2) if x-1 >= 0 else 0
+                        Dfp = D_x_face[z,y,face_idx]
+                    else:
+                        # degenerate single-column: fallback to cell D
+                        Dfp = D[z,y,x]
+                    Dfp = max(Dfp, eps)
+                    diag += Dfp / (dx*dx) * (1.0 + h_robin * dz / Dfp)
+
+                # x-1 neighbor
+                if x-1 >= 0 and Nx > 1:
+                    Dfm = D_x_face[z,y,x-1]
+                    coeff = Dfm / (dx*dx)
+                    rows.append(center); cols.append(idx(z,y,x-1)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    # left boundary: use adjacent face (face between 0 and 1 is D_x_face[...,0]) or fallback
+                    if Nx > 1:
+                        face_idx = 0 if x == 0 else max(0, x-1)
+                        Dfm = D_x_face[z,y,face_idx]
+                    else:
+                        Dfm = D[z,y,x]
+                    Dfm = max(Dfm, eps)
+                    diag += Dfm / (dx*dx) * (1.0 + h_robin * dz / Dfm)
+
+                # ------ Y-direction ------
+                if y+1 < Ny and Ny > 1:
+                    Dfp = D_y_face[z,y,x]
+                    coeff = Dfp / (dy*dy)
+                    rows.append(center); cols.append(idx(z,y+1,x)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    if Ny > 1:
+                        face_idx = min(y-1, Ny-2) if y-1 >= 0 else 0
+                        Dfp = D_y_face[z,face_idx,x]
+                    else:
+                        Dfp = D[z,y,x]
+                    Dfp = max(Dfp, eps)
+                    diag += Dfp / (dy*dy) * (1.0 + h_robin * dz / Dfp)
+
+                if y-1 >= 0 and Ny > 1:
+                    Dfm = D_y_face[z,y-1,x]
+                    coeff = Dfm / (dy*dy)
+                    rows.append(center); cols.append(idx(z,y-1,x)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    if Ny > 1:
+                        face_idx = 0 if y == 0 else max(0, y-1)
+                        Dfm = D_y_face[z,face_idx,x]
+                    else:
+                        Dfm = D[z,y,x]
+                    Dfm = max(Dfm, eps)
+                    diag += Dfm / (dy*dy) * (1.0 + h_robin * dz / Dfm)
+
+                # ------ Z-direction ------
+                if z+1 < Nz and Nz > 1:
+                    Dfp = D_z_face[z,y,x]
+                    coeff = Dfp / (dz*dz)
+                    rows.append(center); cols.append(idx(z+1,y,x)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    if Nz > 1:
+                        face_idx = min(z-1, Nz-2) if z-1 >= 0 else 0
+                        Dfp = D_z_face[face_idx,y,x]
+                    else:
+                        Dfp = D[z,y,x]
+                    Dfp = max(Dfp, eps)
+                    diag += Dfp / (dz*dz) * (1.0 + h_robin * dz / Dfp)
+
+                if z-1 >= 0 and Nz > 1:
+                    Dfm = D_z_face[z-1,y,x]
+                    coeff = Dfm / (dz*dz)
+                    rows.append(center); cols.append(idx(z-1,y,x)); vals.append(-coeff)
+                    diag += coeff
+                else:
+                    if Nz > 1:
+                        face_idx = 0 if z == 0 else max(0, z-1)
+                        Dfm = D_z_face[face_idx,y,x]
+                    else:
+                        Dfm = D[z,y,x]
+                    Dfm = max(Dfm, eps)
+                    diag += Dfm / (dz*dz) * (1.0 + h_robin * dz / Dfm)
+
+                rows.append(center); cols.append(center); vals.append(diag)
+
+    # final matrix
+    A = spsp.coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
+    b = S.ravel(order='C')
+
+    # --- Solve forward: try pyamg else CG w/ Jacobi precond ---
+    use_solver = 'cg_jacobi'
+    cg_info = None
+    phi_flat = None
+    ml = None
+
+    if use_pyamg:
+        try:
+            import pyamg
+            if verbose: print("Building pyamg multigrid hierarchy...")
+            ml = pyamg.smoothed_aggregation_solver(A, symmetry='symmetric', max_coarse=500)
+            try:
+                if verbose: print("Solving forward with pyamg.ml.solve(...)")
+                phi_flat = ml.solve(b, tol=tol, maxiter=maxiter, accel=None)
+                use_solver = 'pyamg_full_solve'
+            except Exception as e_solve:
+                if verbose: print("pyamg.ml.solve failed; falling back to CG with pyamg preconditioner:", e_solve)
+                P = ml.aspreconditioner(cycle='V')
+                phi_flat, cg_info = spla.cg(A, b, tol=tol, maxiter=maxiter, M=P)
+                use_solver = 'cg_with_pyamg_prec'
+        except Exception as e:
+            if verbose: print("pyamg unavailable or failed to build ml:", e)
+            use_solver = 'cg_jacobi'
+
+    if phi_flat is None:
+        if verbose: print("Using Jacobi-preconditioned CG (fallback for forward).")
+        M_diag = A.diagonal()
+        M_inv = 1.0 / (M_diag + 1e-18)
+        M = spla.LinearOperator((N,N), lambda x: M_inv * x)
+        phi_flat, cg_info = spla.cg(A, b, tol=tol, maxiter=maxiter, M=M)
+        use_solver = 'cg_jacobi'
+
+    if cg_info is not None and cg_info != 0 and verbose:
+        print("Forward CG finished with info =", cg_info, "(0 means converged)")
+
+    phi = phi_flat.reshape((Nz, Ny, Nx), order='C')
+    phi_out = np.transpose(phi, (1, 2, 0))
+
+    info = {'solver': use_solver, 'cg_info': int(cg_info) if cg_info is not None else None}
+
+    if not compute_grad:
+        if verbose:
+            print(f"Done (no grad). max(Phi) = {phi_out.max():.4e} 1/cm^3, mean(Phi) = {phi_out.mean():.4e} 1/cm^3")
+            _plot_fluence_panels(phi_out, x_coords_phys, y_coords_phys, np.linspace(0, Nz*dz, Nz))
+        return phi_out, info, None
+
+    # compute adjoint w: require adjoint_rhs provided
+    if adjoint_rhs is None:
+        raise ValueError("compute_grad=True requires adjoint_rhs (lambda = dJ/dphi).")
+
+    lam = np.asarray(adjoint_rhs)
+    if lam.ndim == 1:
+        lam_flat = lam
+    else:
+        # assume shape (Nz,Ny,Nx) or (Ny,Nx,Nz) — prefer (Nz,Ny,Nx)
+        if lam.shape == (Nz, Ny, Nx):
+            lam_flat = lam.ravel(order='C')
+        elif lam.shape == (Ny, Nx, Nz):
+            lam_flat = np.transpose(lam, (2,0,1)).ravel(order='C')
+        else:
+            raise ValueError("adjoint_rhs shape not recognized; expected flattened or (Nz,Ny,Nx) or (Ny,Nx,Nz).")
+
+    # Solve A w = lam_flat (symmetric A)
+    w_flat = None
+    w_info = None
+    if use_solver == 'pyamg_full_solve' and ml is not None:
+        try:
+            if verbose: print("Solving adjoint with pyamg.ml.solve(...)")
+            w_flat = ml.solve(lam_flat, tol=tol, maxiter=maxiter, accel=None)
+        except Exception as e:
+            if verbose: print("pyamg.ml.solve failed on adjoint; falling back to CG:", e)
+            P = ml.aspreconditioner(cycle='V') if ml is not None else None
+            if P is not None:
+                w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=P)
+            else:
+                M_diag = A.diagonal()
+                M_inv = 1.0/(M_diag + 1e-18)
+                M = spla.LinearOperator((N,N), lambda x: M_inv * x)
+                w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=M)
+    else:
+        # use available preconditioner if any
+        if ml is not None:
+            try:
+                P = ml.aspreconditioner(cycle='V')
+                w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=P)
+            except Exception:
+                M_diag = A.diagonal()
+                M_inv = 1.0/(M_diag + 1e-18)
+                M = spla.LinearOperator((N,N), lambda x: M_inv * x)
+                w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=M)
+        else:
+            M_diag = A.diagonal()
+            M_inv = 1.0/(M_diag + 1e-18)
+            M = spla.LinearOperator((N,N), lambda x: M_inv * x)
+            w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=M)
+
+    if w_info is not None and w_info != 0 and verbose:
+        print("Adjoint CG finished with info =", w_info, "(0 means converged)")
+
+    w = w_flat.reshape((Nz, Ny, Nx), order='C')
+
+    # vectorized gradient accumulation over faces
+    grad = np.zeros_like(mu_s, dtype=np.float32)
+
+    # X-faces
+    if Nx > 1:
+        u , v = D[:, :, :-1] , D[:, :, 1:]    # D at left and right cell
+        du,dv = dD[:, :, :-1], dD[:, :, 1:]  # derivative at left and right
+        denom = (u + v) + eps
+        denom2 = denom * denom
+        # ∂G/∂u = 2 v^2 /(u+v)^2; ∂G/∂v = 2 u^2 /(u+v)^2
+        C_left  = 2.0 * du * (v * v) / denom2 * inv_dx2
+        C_right = 2.0 * dv * (u * u) / denom2 * inv_dx2
+        phi_L , phi_R = phi[:, :, :-1] , phi[:, :, 1:]
+        w_L , w_R = w[:, :, :-1] , w[:, :, 1:]
+        T = (w_L - w_R) * (phi_R - phi_L)
+        grad[:, :, :-1] += - C_left  * T
+        grad[:, :, 1: ] += - C_right * T
+
+    # Y-faces
+    if Ny > 1:
+        u , v = D[:, :-1, :] , D[:, 1:, :]
+        du,dv = dD[:, :-1, :], dD[:, 1:, :]
+        denom = (u + v) + eps
+        denom2 = denom * denom
+
+        C_front = 2.0 * du * (v * v) / denom2 * inv_dy2
+        C_back  = 2.0 * dv * (u * u) / denom2 * inv_dy2
+        phi_F , phi_B = phi[:, :-1, :] , phi[:, 1:, :]
+        w_F , w_B = w[:, :-1, :] , w[:, 1:, :]
+        T = (w_F - w_B) * (phi_B - phi_F)
+        grad[:, :-1, :] += - C_front * T
+        grad[:, 1:,  :] += - C_back  * T
+
+    # Z-faces
+    if Nz > 1:
+        u , v = D[:-1, :, :] , D[1:, :, :]
+        du,dv = dD[:-1, :, :], dD[1:, :, :]
+        denom = (u + v) + eps
+        denom2 = denom * denom
+
+        C_top = 2.0 * du * (v * v) / denom2 * inv_dz2
+        C_bot = 2.0 * dv * (u * u) / denom2 * inv_dz2
+
+        phi_T , phi_B = phi[:-1, :, :] , phi[1:, :, :]
+        w_T , w_B = w[:-1, :, :] , w[1:, :, :]
+        T = (w_T - w_B) * (phi_B - phi_T)
+        grad[:-1, :, :] += - C_top * T
+        grad[1:,  :, :] += - C_bot * T
+
+    grad = np.transpose(grad, (1,2,0))
+    if verbose:
+        print(f"Done. max(Phi) = {phi_out.max():.4e} 1/cm^3, mean(Phi) = {phi_out.mean():.4e} 1/cm^3")
+        _plot_fluence_panels(phi_out, x_coords_phys, y_coords_phys, np.linspace(0, Nz*dz, Nz))
+
+    return phi_out, info, grad

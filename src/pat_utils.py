@@ -280,6 +280,8 @@ def _calculate_time_axis(bbox_cm: Tuple[float, float, float, float],
     max_dist += buffer_cm / 100.0
     t_max = max_dist / info.c  # in seconds
     Nt = int(np.ceil(t_max * info.fs)) + 1
+    if Nt % 2 == 1:
+        Nt += 1 # make sure the time axis length is even for subsampling
     t = np.arange(Nt) / info.fs
     return t
 
@@ -384,6 +386,36 @@ def _load_pa_raw(input_dir: str,
     if verbose:
         print(f"Data after frame averaging and combining: {data_final.shape}, dtype={data_final.dtype}")
     return data_final
+
+def load_pa_rf_aligned(input_dir: str,
+                       G_meta,
+                       info: LinearSystemParam,
+                       channel_file: str = '1_layer0_idx1_CUSTOMDATA_RF.mat',
+                       subsample: bool = True,
+                       verbose: bool = True,
+                       ) -> np.ndarray:
+    t_axis_recon = G_meta['t']
+    t0 = int(t_axis_recon[0]*info.fs)
+    Nt = t_axis_recon.size
+    pa_raw = _load_pa_raw(input_dir, channel_file, verbose=False) # (N_ELEMENTS, AlignedSampleNum)
+    f_lo_nodes = [0.0, F_LO_CUTOFF, F_LO_CUTOFF, 1.0]
+    m_lo_nodes = [0.0, 0.0, 1.0, 1.0]
+    DC_cancel = firwin2(65, f_lo_nodes, m_lo_nodes)
+    f_hi_nodes = [0.0, F_HI_CUTOFF, F_HI_CUTOFF, 1.0]
+    m_hi_nodes = [1.0, 1.0, 0.0, 0.0]
+    HFN_cancel = firwin2(33, f_hi_nodes, m_hi_nodes)
+    pa_raw = convolve(pa_raw, DC_cancel[:, None], mode='same', method='auto')
+    pa_raw = convolve(pa_raw, HFN_cancel[:, None], mode='same', method='auto')
+    pa_raw = pa_raw[:, t0:t0+Nt]
+    if subsample:
+        pa_raw = 0.5*(pa_raw[:,::2] + pa_raw[:,1::2])
+    if verbose:
+        print(f"RF data shape = ", pa_raw.shape)
+    pa_raw_flatten = pa_raw.flatten(order='C')  # (N_ELEMENTS*Nt,)
+    if verbose:
+        print("Raw PA data loaded and preprocessed.")
+    return pa_raw_flatten
+
 
 def pa_inverse_recon(input_dir: str,
                      info: LinearSystemParam,

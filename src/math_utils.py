@@ -239,6 +239,7 @@ def generate_G_from_h_fft(h: np.ndarray,
     S3[-L_end_artifact:, :, :] = 0.0  # zero out end artifacts due to FFT circular conv
     if subsampling:
         S3 = 0.5*S3[::2,:,:] + 0.5*S3[1::2,:,:]
+        Nt = Nt//2
     # permute to (Ne, Nt, Nvox) then flatten to (Ne*Nt, Nvox) with row = ie*Nt + it
     S_perm = np.transpose(S3, (1, 0, 2))
     G2D = S_perm.reshape(Ne * Nt, Nvox, order='C')
