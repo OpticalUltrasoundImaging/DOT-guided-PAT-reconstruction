@@ -422,8 +422,8 @@ def optimize_mu_maps_regularize(
     history = {'residual norm': [],
                'mua hist': [],
                'mus hist': [],
-               'mua_frac_change':[],
-               'mus_frac_change':[],
+               'mua frac change':[],
+               'mus frac change':[],
                'mua sparsity': []}
 
     RF_data = np.asarray(RF_data, dtype=np.float32).ravel()
@@ -482,12 +482,12 @@ def optimize_mu_maps_regularize(
         history['residual norm'].append(data_fidelity_norm)
         history['mua hist'].append(mu_a)
         history['mus hist'].append(mu_s)
-        history['mua_frac_change'].append(fractional_change_in_mu_a)
-        history['mus_frac_change'].append(fractinoal_change_in_mu_s)
+        history['mua frac change'].append(fractional_change_in_mu_a)
+        history['mus frac change'].append(fractinoal_change_in_mu_s)
         history['mua sparsity'].append(np.mean(mu_a == 0.0))
         mu_a_prev = mu_a.copy()
         mu_s_prev = mu_s.copy()
         if verbose:
-            print(f"Iter {it:3d} | resobj {data_fidelity_norm:.6e} | Δμ_s={fractinoal_change_in_mu_s:.3e} | Δμ_a={fractional_change_in_mu_a:.4e} | sparsity(mu_a)={history['mu_a_sparsity'][-1]:.3f}")
+            print(f"Iter {it:3d} | resobj {data_fidelity_norm:.6e} | Δμ_s={fractinoal_change_in_mu_s:.3e} | Δμ_a={fractional_change_in_mu_a:.4e} | sparsity={history['mua sparsity'][-1]:.3f}")
     return mu_a, mu_s, history
 
