@@ -381,14 +381,14 @@ def optimize_mu_maps(RF_data,
 
     return mu_a , mu_s , history
 
-def _log_compress_phi(phi, dB_range, phi_scale_linear: float = 1.0):
+def _log_compress_phi(phi, dB_range, phi_scale_linear: float = 0.5):
     min_dB = 10 ** (-dB_range / 20.0)
     phi_norm = phi / np.max(phi) if np.max(phi) != 0 else phi
     # RF_log = (20/dB_US)*log10(RF_env_norm)+1
     with np.errstate(divide='ignore', invalid='ignore'):
         phi_log = (20.0 / dB_range) * np.log10(np.maximum(phi_norm, 1e-20)) + 1.0
     phi_log[phi_norm < min_dB] = 0.0
-    return phi_scale_linear*phi_log + 1e-6
+    return phi_scale_linear*phi_log + 1.0
 
 def optimize_mu_maps_regularize(
     RF_data,           # y, shape (m,)
@@ -403,7 +403,7 @@ def optimize_mu_maps_regularize(
     # FISTA / mu_a params
     lam_mu_a: float = 1e-3,
     # mu_s params
-    mu_s_step: float = 1e-2,
+    mu_s_step: float = 1e-3,
     mu_s_reg_lambda: float = 1e-2,
     # Laplacian (either pass prebuilt Lap or pass grid params)
     Lap: Optional[csr_matrix] = None,
@@ -469,7 +469,7 @@ def optimize_mu_maps_regularize(
 
         if grad_mu_s_data is None:
             raise RuntimeError("No mu_s gradient is returned")
-        grad_mu_s_data = np.asarray(grad_mu_s_data, dtype=np.float32).ravel()
+        grad_mu_s_data = np.asarray(grad_mu_s_data * phi, dtype=np.float32).ravel()
 
         # Update mu_s with Laplacian regularization
         grad_smooth = mu_s_reg_lambda * (Lap @ (Lap @ mu_s))  # (n,)

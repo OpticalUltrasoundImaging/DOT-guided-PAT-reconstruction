@@ -162,7 +162,7 @@ def compute_h_numba(t, z_grid, x_grid, element_centers,
             xr = xe_right[ie]
             re = r_elem[ie]
             ct = cos_theta_elem[ie]
-            inv_r = 1.0 / re / re
+            inv_r = 1.0 / re
 
             # Loop over time samples (compiled; this is fast)
             for it in range(Nt):
