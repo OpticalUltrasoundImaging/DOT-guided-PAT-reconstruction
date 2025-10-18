@@ -381,6 +381,15 @@ def optimize_mu_maps(RF_data,
 
     return mu_a , mu_s , history
 
+def _log_compress_phi(phi, dB_range, phi_scale_linear: float = 1.0):
+    min_dB = 10 ** (-dB_range / 20.0)
+    phi_norm = phi / np.max(phi) if np.max(phi) != 0 else phi
+    # RF_log = (20/dB_US)*log10(RF_env_norm)+1
+    with np.errstate(divide='ignore', invalid='ignore'):
+        phi_log = (20.0 / dB_range) * np.log10(np.maximum(phi_norm, 1e-20)) + 1.0
+    phi_log[phi_norm < min_dB] = 0.0
+    return phi_scale_linear*phi_log + 1e-6
+
 def optimize_mu_maps_regularize(
     RF_data,           # y, shape (m,)
     G,                 # system matrix (m x n) sparse
@@ -393,10 +402,8 @@ def optimize_mu_maps_regularize(
     n_iters: int = 20,
     # FISTA / mu_a params
     lam_mu_a: float = 1e-3,
-    fista_iters: int = 10,
-    fista_estimate_L: Optional[float] = None,
     # mu_s params
-    mu_s_step: float = 1e-3,
+    mu_s_step: float = 1e-2,
     mu_s_reg_lambda: float = 1e-2,
     # Laplacian (either pass prebuilt Lap or pass grid params)
     Lap: Optional[csr_matrix] = None,
@@ -438,32 +445,28 @@ def optimize_mu_maps_regularize(
 
     for it in range(1, n_iters + 1):
         phi, _, _ = _estimate_fluence(mu_a, mu_s, grid_size = grid_shape, pixel_size_cm = grid_spacing, compute_grad = False, adjoint_rhs = None)  # (n,)
-        if verbose:
-            print(f"Iter {it:3d}, first pass fluence solver completed")
         # Update mu_a: minimize 0.5||A x - y||^2 + lam||x||1, A = G @ diag(phi)
+        phi = _log_compress_phi(phi, 45)
         A = G*phi[np.newaxis,:]
+        A_norms = np.linalg.norm(A,axis=0)
+        A_norms[A_norms == 0] = 1.0
+        A /= A_norms
         # Run FISTA with warm-start and estimated L optional
         # mu_a = _fista_l1_lsqr(A, RF_data, lam=lam_mu_a, n_iter=fista_iters, x0=mu_a, L=fista_estimate_L, nonneg=True, verbose=False)
         solver = PATInverseSolver(A, RF_data)
         mu_a = solver.reconstruct(method='l1', lambda_reg = lam_mu_a , x0 = mu_a, verbose=False)
-        mu_a *= G_norms
+        mu_a /= A_norms # MUST BE DIVIDE!!!
         mu_a = np.clip(mu_a, 0.0, None)
         mu_a = _enforce_mean(mu_a, global_mu_a_avg)
-        if verbose:
-            print(f"Iter {it:3d}, mua updated")
         
         # Recompute phi after mu_a update, and output mu_s gradient this time
-        RF_pred = G.dot(mu_a * phi)
+        RF_pred = G.dot(mu_a*phi)
         residual = RF_pred - RF_data
         data_fidelity_norm = 0.5 * np.linalg.norm(residual)**2
         adjoint_rhs_flat = mu_a * (G.T.dot(residual))
         adjoint_rhs_2d = adjoint_rhs_flat.reshape(grid_shape , order='C') # (Nz, Nx)
-        if verbose:
-            print(f"Iter {it:3d}, source adjoint term computed")
         phi , _ , grad_mu_s_data = _estimate_fluence(mu_a , mu_s , grid_size = grid_shape , pixel_size_cm = grid_spacing , compute_grad = True, adjoint_rhs = adjoint_rhs_2d)
 
-        if verbose:
-            print(f"Iter {it:3d}, second pass fluence solver completed")
         if grad_mu_s_data is None:
             raise RuntimeError("No mu_s gradient is returned")
         grad_mu_s_data = np.asarray(grad_mu_s_data, dtype=np.float32).ravel()
@@ -472,8 +475,6 @@ def optimize_mu_maps_regularize(
         grad_smooth = mu_s_reg_lambda * (Lap @ (Lap @ mu_s))  # (n,)
         grad_mu_s = grad_mu_s_data + grad_smooth
         mu_s = mu_s - mu_s_step * grad_mu_s
-        if verbose:
-            print(f"Iter {it:3d}, mus updated")
         mu_s = np.clip(mu_s, 0.0, None)
         mu_s = _enforce_mean(mu_s, global_mu_s_avg)
         

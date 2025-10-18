@@ -285,7 +285,8 @@ def _calculate_time_axis(bbox_cm: Tuple[float, float, float, float],
     t = np.arange(Nt) / info.fs
     return t
 
-def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling_factor: Tuple[float, float], info: LinearSystemParam, 
+def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling_factor: Tuple[float, float], info: LinearSystemParam,
+                            subsampling:bool = True,
                             verbose=False):
     x_min_cm , x_max_cm , z_min_cm , z_max_cm = bbox_cm
     scaling_factor_x , scaling_factor_z = scaling_factor
@@ -331,7 +332,7 @@ def generate_imaging_matrix(bbox_cm: Tuple[float, float, float, float] , scaling
                         float(0.0),
                         )
 
-    G = generate_G_from_h_fft(h, Bt, Bt_deriv, t_axis, normalize=False)
+    G = generate_G_from_h_fft(h, Bt, Bt_deriv, t_axis, normalize=False, subsampling = subsampling)
     meta = {
         't': t_axis,
         'Z': Z, 
