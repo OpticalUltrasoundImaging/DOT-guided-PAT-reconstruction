@@ -13,6 +13,9 @@ from scipy.ndimage import zoom, gaussian_filter
 from scipy.interpolate import RegularGridInterpolator
 from scipy.sparse import diags, identity, vstack, csr_matrix, kron
 from scipy.sparse.linalg import lsqr
+from skimage.filters import meijering
+from skimage.exposure import rescale_intensity
+from skimage.restoration import denoise_bilateral
 
 N_ELEMENTS = 128  # default number of elements for linear array
 Z_MAX_CM = 4.0  # cm, default max depth for reconstruction
@@ -381,7 +384,7 @@ def optimize_mu_maps(RF_data,
 
     return mu_a , mu_s , history
 
-def _log_compress_phi(phi, dB_range, phi_scale_linear: float = 0.5):
+def _log_compress_phi(phi, dB_range, phi_scale_linear: float = 0.25):
     min_dB = 10 ** (-dB_range / 20.0)
     phi_norm = phi / np.max(phi) if np.max(phi) != 0 else phi
     # RF_log = (20/dB_US)*log10(RF_env_norm)+1
@@ -492,3 +495,31 @@ def optimize_mu_maps_regularize(
             print(f"Iter {it:3d} | resobj {data_fidelity_norm:.6e} | Δμ_s={fractinoal_change_in_mu_s:.3e} | Δμ_a={fractional_change_in_mu_a:.4e} | sparsity={history['mua sparsity'][-1]:.3f}")
     return mu_a, mu_s, history
 
+def enhance_vessels(
+    mua_map,
+    pre_smooth=True,
+    bilateral_sigma_color=0.05,
+    bilateral_sigma_spatial=2,
+    sigmas=(1, 2, 3, 4),          # scales in pixels ~ vessel radii
+    black_ridges=False,
+    vessel_weight=0.6,            # blend factor [0..1]: higher = stronger enhancement
+):
+    mua_map = np.asarray(mua_map, dtype=float)
+    mua_map = np.clip(mua_map, 0, 1)
+
+    # 1) Optional gentle edge-preserving pre-smoothing
+    if pre_smooth:
+        mua_map_pre = denoise_bilateral(mua_map, sigma_color=bilateral_sigma_color,
+                                    sigma_spatial=bilateral_sigma_spatial, channel_axis=None)
+    else:
+        mua_map_pre = mua_map
+
+    # 2) Meijering vesselness (bright tubes by default; set black_ridges=True for dark tubes)
+    vesselness = meijering(mua_map_pre, sigmas=sigmas, black_ridges=black_ridges)
+    vesselness = rescale_intensity(vesselness, in_range='image', out_range=(0.0, 1.0))
+
+    # 3) Blend vesselness into original map
+    #    Keep values in [0,1] and preserve edges.
+    enhanced = mua_map_pre * (1.0 + vessel_weight * vesselness)
+    enhanced = np.clip(enhanced, 0.0, 1.0)
+    return enhanced, vesselness
