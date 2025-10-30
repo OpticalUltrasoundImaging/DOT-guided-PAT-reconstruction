@@ -36,7 +36,7 @@ cd DOT-guided-PAT-reconstruction
 ```
 
 ## Contact
-Yixiao Lin
-Department of Biomedical Engineering
-Washington University in St. Louis
+**Yixiao Lin**  
+Department of Biomedical Engineering  
+Washington University in St. Louis  
 lin.yixiao@wustl.edu
