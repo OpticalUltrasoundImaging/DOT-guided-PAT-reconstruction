@@ -1,11 +1,8 @@
-import os
-import sys
-from pathlib import Path
 import numpy as np
 from .load_data_utils import LinearSystemParam
-from .fluence_utils import compute_phi_heterogeneous, compute_phi_and_grad
+from .fluence_utils import compute_phi_and_grad
 from .us_utils import pe_das_linear, nakagami_linear
-from .pat_utils import pa_das_linear, pa_inverse_recon
+from .pat_utils import pa_das_linear
 from .recon_iq_utils import PATInverseSolver
 
 from typing import Optional, Tuple
@@ -13,6 +10,8 @@ from scipy.ndimage import zoom, gaussian_filter
 from scipy.interpolate import RegularGridInterpolator
 from scipy.sparse import diags, identity, vstack, csr_matrix, kron
 from scipy.sparse.linalg import lsqr
+from scipy.signal import hilbert
+import cv2
 from skimage.filters import meijering
 from skimage.exposure import rescale_intensity
 from skimage.restoration import denoise_bilateral
@@ -35,7 +34,7 @@ def _initialize_mus(input_dir: str,
                     mu_s_mean_cm: float = 8.0,
                     dB_US: int=75,
                     depth_max_cm: float = Z_MAX_CM*1e-2) -> tuple[np.ndarray, np.ndarray]:
-    _, RF_env_raw, US_img = pe_das_linear(input_dir, info_US, dB_US, 'hann', 'gsf')
+    _, RF_env_raw, US_img = pe_das_linear(input_dir, info_US, dB_US, 'kaiser', 'none')
     naka_img, _ = nakagami_linear(RF_env_raw, info_US)
     zmax_idx = int(depth_max_cm / np.max(info_US.d_sample) * naka_img.shape[0])
     naka_img = naka_img[0:zmax_idx,:]
@@ -144,7 +143,7 @@ def _initialize_mua(input_dir: str,
                     info_PA: LinearSystemParam,
                     mu_a_mean_cm: float = 0.03,
                     depth_max_cm: float = Z_MAX_CM*1e-2,
-                    dB_PA: int = 25) -> tuple[np.ndarray, np.ndarray]:
+                    dB_PA: int = 35) -> tuple[np.ndarray, np.ndarray]:
     _, RF_env_raw = pa_das_linear(input_dir, info_PA, 'hann', 'cf')
     min_dB = 10 ** (-dB_PA / 20.0)
     RF_env_norm = RF_env_raw / np.max(RF_env_raw) if np.max(RF_env_raw) != 0 else RF_env_raw
@@ -483,9 +482,15 @@ def optimize_mu_maps_regularize(
         
         fractional_change_in_mu_a = np.linalg.norm(mu_a - mu_a_prev) / (np.linalg.norm(mu_a_prev) + 1e-14)
         fractinoal_change_in_mu_s = np.linalg.norm(mu_s - mu_s_prev) / (np.linalg.norm(mu_s_prev) + 1e-12)
+
+        mu_a_2d = mu_a.reshape((Nz,Nx), order = 'C')
+        mu_a_2d = abs(hilbert(mu_a_2d, axis=0))
+        mu_a_2d = cv2.bilateralFilter(src = cv2.blur(np.asarray(mu_a_2d,dtype=np.float32),(2,2)),  d=0, sigmaColor = 0.05, sigmaSpace = 3)
+        mu_s_2d = mu_s.reshape((Nz,Nx), order = 'C')
+
         history['residual norm'].append(data_fidelity_norm)
-        history['mua hist'].append(mu_a)
-        history['mus hist'].append(mu_s)
+        history['mua hist'].append(mu_a_2d)
+        history['mus hist'].append(mu_s_2d)
         history['mua frac change'].append(fractional_change_in_mu_a)
         history['mus frac change'].append(fractinoal_change_in_mu_s)
         history['mua sparsity'].append(np.mean(mu_a == 0.0))

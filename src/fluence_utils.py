@@ -736,7 +736,7 @@ def compute_phi_and_grad(mu_a_cm,
         M_diag = A.diagonal()
         M_inv = 1.0 / (M_diag + 1e-18)
         M = spla.LinearOperator((N,N), lambda x: M_inv * x)
-        phi_flat, cg_info = spla.cg(A, b, tol=tol, maxiter=maxiter, M=M)
+        phi_flat, cg_info = spla.cg(A, b, rtol=tol, maxiter=maxiter, M=M)
         use_solver = 'cg_jacobi'
 
     if cg_info is not None and cg_info != 0 and verbose:
@@ -801,7 +801,7 @@ def compute_phi_and_grad(mu_a_cm,
             M_diag = A.diagonal()
             M_inv = 1.0/(M_diag + 1e-18)
             M = spla.LinearOperator((N,N), lambda x: M_inv * x)
-            w_flat, w_info = spla.cg(A, lam_flat, tol=tol, maxiter=maxiter, M=M)
+            w_flat, w_info = spla.cg(A, lam_flat, rtol=tol, maxiter=maxiter, M=M)
 
     if w_info is not None and w_info != 0 and verbose:
         print("Adjoint CG finished with info =", w_info, "(0 means converged)")

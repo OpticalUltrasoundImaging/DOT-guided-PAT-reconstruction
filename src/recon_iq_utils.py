@@ -309,8 +309,6 @@ class Apodization:
         # Regularization term: shape (L_subarray, L_subarray, data_total1)
         reg = (0.2 / L_subarray) * np.trace(corr_matrix, axis1=0, axis2=1)[None, None, :] * np.eye(L_subarray)[:, :, None]
         C_all = 0.5 * corr_matrix + 0.5 * corr_matrix2 + reg  # shape (L_subarray, L_subarray, data_total1)
-
-        # Solve all depths at once using broadcasting (loop-free)
         sum_tmp = np.zeros(data_total1, dtype=np.float64)
         for idx in range(data_total1):
             try:
