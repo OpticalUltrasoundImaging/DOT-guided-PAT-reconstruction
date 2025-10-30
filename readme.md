@@ -31,7 +31,7 @@ This repository provides end-to-end computational tools for quantitative photoac
 Clone this repository:
 
 ```bash
-git clone https://github.com/YXLin1159/DOT-guided_PAT-reconstruction.git
+git clone https://github.com/OpticalUltrasoundImaging/DOT-guided_PAT-reconstruction.git
 cd DOT-guided-PAT-reconstruction
 ```
 
